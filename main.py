@@ -21,7 +21,16 @@ FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هن
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
-MAX_SHOWN = 40   
+MAX_SHOWN = 50   
+
+# قائمة واسعة ومتنوعة من الأسهم النشطة والساخنة لضمان التغطية الفورية مع المسح العام
+BACKUP_WATCH_LIST = [
+    "GENK", "DFNS", "TDIC", "BSP", "AMTD", "TC", 
+    "AEHL", "TGL", "YRD", "GLND", "LQDA", "GRML", "NIVF", "BDRX", 
+    "AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "GME", "AMC",
+    "PLTR", "NIO", "COIN", "MARA", "RIOT", "SAVA", "VERU", "APLD", "CENN",
+    "MULN", "BBBY", "FFIE", "PROG", "BBIG", "CEI", "SOS", "INDV", "INPX"
+]
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -181,45 +190,86 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# جلب الأسهم الأكثر ارتفاعاً (Top Gainers) ديناميكياً
+# دمج المسح الشامل (Market Movers + Watchlist واسعة)
 # ========================================
-def fetch_top_gainers():
-    if not TWELVE_DATA_KEY or TWELVE_DATA_KEY == "ضع_مفتاح_تولف_داتا_هنا":
-        print("❌ مفتاح Twelve Data غير متوفر.")
-        return []
+def fetch_all_market_stocks():
+    all_stocks_dict = {}
 
-    url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&apikey={TWELVE_DATA_KEY}"
-    stocks = []
-
-    try:
-        print("🔄 جاري فحص وسحب الأسهم الأكثر ارتفاعاً (Top Gainers) من السوق...")
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            values = data.get("values", [])
-            for item in values:
-                symbol = item.get("symbol")
-                price = float(item.get("price", 0.0) or 0.0)
-                change_pct = float(item.get("percent_change", 0.0) or 0.0)
-                volume = int(item.get("volume", 0) or 0)
-                
-                if symbol and price > 0:
-                    # فلترة الشركات التي نسبة صعودها 2% فأكثر
-                    if change_pct >= 2.0:
-                        stocks.append({
+    # 1. جلب الـ Top Gainers عبر Twelve Data
+    if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
+        url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&apikey={TWELVE_DATA_KEY}"
+        try:
+            print("🔄 جاري سحب الـ Top Gainers من Twelve Data...")
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                for item in data.get("values", []):
+                    symbol = item.get("symbol")
+                    price = float(item.get("price", 0.0) or 0.0)
+                    change_pct = float(item.get("percent_change", 0.0) or 0.0)
+                    volume = int(item.get("volume", 0) or 0)
+                    if symbol and price > 0:
+                        all_stocks_dict[symbol] = {
                             "symbol": symbol,
                             "price": price,
                             "change_pct": change_pct,
                             "volume": volume
-                        })
-        else:
-            print(f"⚠️ خطأ في الاستجابة من واجهة Market Movers: {res.status_code}")
-    except Exception as e:
-        print(f"⚠️ خطأ أثناء جلب الـ Top Gainers: {e}")
+                        }
+        except Exception as e:
+            print(f"⚠️ خطأ في سحب Market Movers: {e}")
 
-    # ترتيب الأسهم حسب نسبة الصعود تنازلياً (الأعلى صعوداً أولاً)
-    stocks.sort(key=lambda x: x["change_pct"], reverse=True)
-    return stocks
+    # 2. فحص قائمة الأسهم الواسعة لتغطية أي سهم متحرك لم يظهر في القائمة العامة
+    print("🔄 جاري فحص الأسهم الإضافية لضمان عدم تفويت أي فرصة...")
+    for symbol in BACKUP_WATCH_LIST:
+        if symbol in all_stocks_dict:
+            continue
+        
+        # محاولة عبر Twelve Data لكل سهم فردي إذا لزم الأمر
+        if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
+            try:
+                single_url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVE_DATA_KEY}"
+                res = requests.get(single_url, timeout=4)
+                if res.status_code == 200:
+                    data = res.json()
+                    if "price" in data:
+                        price = float(data.get("price", 0.0) or 0.0)
+                        change_pct = float(data.get("percent_change", 0.0) or 0.0)
+                        volume = int(data.get("volume", 0) or 0)
+                        if price > 0:
+                            all_stocks_dict[symbol] = {
+                                "symbol": symbol,
+                                "price": price,
+                                "change_pct": change_pct,
+                                "volume": volume
+                            }
+                time.sleep(0.2)
+            except:
+                pass
+
+        # أو عبر Finnhub كاحتياطي سريع
+        if symbol not in all_stocks_dict and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
+            try:
+                fh_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+                res = requests.get(fh_url, timeout=4)
+                if res.status_code == 200:
+                    data = res.json()
+                    price = float(data.get("c", 0.0) or 0.0)
+                    change_pct = float(data.get("dp", 0.0) or 0.0)
+                    if price > 0:
+                        all_stocks_dict[symbol] = {
+                            "symbol": symbol,
+                            "price": price,
+                            "change_pct": change_pct,
+                            "volume": 0
+                        }
+                time.sleep(0.2)
+            except:
+                pass
+
+    # تصفية الأسهم التي حققت صعوداً بنسبة 2% فأكثر فقط
+    filtered_list = [s for s in all_stocks_dict.values() if s["change_pct"] >= 2.0]
+    filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
+    return filtered_list
 
 # ================================
 # الدالة التنفيذية لدورة الفحص الواحدة
@@ -232,7 +282,7 @@ def run_scan_cycle():
         print("⏸️ السوق مغلق حالياً، لا توجد تنبيهات للإرسال.")
         return
 
-    stocks = fetch_top_gainers()
+    stocks = fetch_all_market_stocks()
     if not stocks:
         print("⚠️ لم يتم العثور على أسهم تطابق شروط الصعود في هذه الجولة.")
         return
@@ -245,7 +295,7 @@ def run_scan_cycle():
         current_price = stock["price"]
         volume_val = stock["volume"]
         
-        # عدم تكرار التنبيه إلا إذا ارتفع السهم عن آخر سعر تم إرساله له
+        # عدم التكرار إلا في حال ارتفاع السهم أكثر عن آخر سعر تم إرساله
         if symbol in seen_stocks:
             last_alerted_price = seen_stocks[symbol].get("last_price", 0.0)
             if current_price <= last_alerted_price:
@@ -282,7 +332,7 @@ def run_scan_cycle():
 # التشغيل المستمر (Loop) كل 3 دقائق
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (فحص السوق الديناميكي كل 3 دقائق)...")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (فحص السوق الشامل كل 3 دقائق)...")
     while True:
         try:
             run_scan_cycle()
