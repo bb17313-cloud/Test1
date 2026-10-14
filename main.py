@@ -184,7 +184,7 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# جلب البيانات عبر Twelve Data (المصدر الرئيسي)
+# جلب البيانات عبر Twelve Data
 # ========================================
 def fetch_from_twelve_data(symbol):
     if not TWELVE_DATA_KEY or TWELVE_DATA_KEY == "ضع_مفتاح_تولف_داتا_هنا":
@@ -205,7 +205,7 @@ def fetch_from_twelve_data(symbol):
     return None
 
 # ========================================
-# جلب البيانات عبر Finnhub (المصدر الاحتياطي)
+# جلب البيانات عبر Finnhub (احتياطي دقيق)
 # ========================================
 def fetch_from_finnhub(symbol):
     if not FINNHUB_KEY or FINNHUB_KEY == "ضع_مفتاح_فينهب_هنا":
@@ -218,30 +218,33 @@ def fetch_from_finnhub(symbol):
             data = res.json()
             price = float(data.get("c", 0.0))
             change_pct = float(data.get("dp", 0.0))
+            volume = int(data.get("v", 0) or 0)
             if price > 0:
-                return {"symbol": symbol, "price": price, "change_pct": change_pct, "volume": 50000}
+                return {"symbol": symbol, "price": price, "change_pct": change_pct, "volume": volume}
     except Exception as e:
         print(f"⚠️ خطأ Finnhub لـ {symbol}: {e}")
     return None
 
 # ========================================
-# دالة الجلب التكاملية
+# دالة الجلب المتكاملة (بدون أي استبعاد)
 # ========================================
 def fetch_filtered_stocks(session_type):
     filtered_stocks = []
-    vol_limit = 15000 if session_type in ["premarket", "postmarket"] else 30000
-
-    print("🔄 جاري فحص الأسهم عبر النظام التكاملي (Twelve Data + Finnhub)...")
+    
+    print("🔄 جاري فحص جميع الأسهم المتاحة بدون استبعاد...")
 
     for symbol in WATCH_LIST:
         stock_data = fetch_from_twelve_data(symbol)
         
-        if not stock_data:
-            time.sleep(0.5)
+        # إذا لم نجد بيانات من Twelve Data، نجرب Finnhub
+        if not stock_data or stock_data["price"] == 0:
+            time.sleep(0.3)
             stock_data = fetch_from_finnhub(symbol)
 
-        if stock_data:
-            if stock_data["change_pct"] >= 2.0 and stock_data["volume"] >= vol_limit:
+        # إذا حصلنا على سهم صالح وبأي حجم أو حتى لو كان الحجم 0، نقبله فوراً ولا نستبعده
+        if stock_data and stock_data["price"] > 0:
+            # شرط الصعود فقط (أكبر من أو يساوي 2%) مع ضمان قبول السهم بغض النظر عن قيمة الحجم
+            if stock_data["change_pct"] >= 2.0:
                 filtered_stocks.append(stock_data)
         
         time.sleep(0.2)
@@ -262,7 +265,7 @@ def run_scan_cycle():
 
     stocks = fetch_filtered_stocks(session_key)
     if not stocks:
-        print("⚠️ لم يتم العثور على أسهم تطابق شروط الفلترة في هذه الجولة.")
+        print("⚠️ لم يتم العثور على أسهم تطابق شروط الصعود في هذه الجولة.")
         return
 
     seen_stocks = load_seen()
@@ -271,23 +274,25 @@ def run_scan_cycle():
     for stock in stocks[:MAX_SHOWN]:
         symbol = stock["symbol"]
         current_price = stock["price"]
+        volume_val = stock["volume"]
         
-        # التحقق إذا كان السهم تم إرساله من قبل وهل ارتفع مقارنة بآخر سعر تم تنبيهك به
         if symbol in seen_stocks:
             last_alerted_price = seen_stocks[symbol].get("last_price", 0.0)
             if current_price <= last_alerted_price:
-                # لم يحدث ارتفاع جديد، تجاهل التنبيه لتكراره
                 continue
 
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
         tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
+
+        # تنسيق شكل عرض الحجم (إذا كان متوفراً يعرضه بالأرقام، وإذا لم يتوفر يكتب "غير متوفر" بدلًا من وضع رقم وهمي)
+        vol_str = f"{volume_val:,}" if volume_val > 0 else "غير متوفر (يعتمد على المنصة)"
 
         message = (
             f"🚨 <b>تنبيه سهم جديد / تحديث ارتفاع</b> ({session_name})\n\n"
             f"🔹 الرمز: <b>{symbol}</b>\n"
             f"💵 السعر الحالي: <b>${current_price:.2f}</b>\n"
             f"📈 التغير: <b>{stock['change_pct']:+.2f}%</b>\n"
-            f"📊 الحجم: <b>{stock['volume']:,}</b>\n\n"
+            f"📊 الحجم: <b>{vol_str}</b>\n\n"
             f"📄 <b>أحدث إفصاحات SEC:</b>\n{sec_summary}\n\n"
             f"📈 <a href='{tv_url}'>فتح الشارت على TradingView</a>"
         )
