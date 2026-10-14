@@ -101,7 +101,6 @@ def send_telegram_message(text):
 # ================================
 def get_sec_description(f_form, item_val="", doc_text=""):
     f_upper = f_form.upper()
-    item_str = str(item_val)
     text_lower = doc_text.lower() if doc_text else ""
 
     if f_upper == "10-K":
@@ -251,9 +250,9 @@ def fetch_filtered_stocks(session_type):
     return filtered_stocks
 
 # ================================
-# الدالة الرئيسية لتشغيل البوت
+# الدالة التنفيذية لدورة الفحص الواحدة
 # ================================
-def main():
+def run_scan_cycle():
     session_key, session_name = get_current_session()
     print(f"🔍 الجلسة الحالية: {session_name}")
 
@@ -263,7 +262,7 @@ def main():
 
     stocks = fetch_filtered_stocks(session_key)
     if not stocks:
-        print("⚠️ لم يتم العثور على أسهم تطابق شروط الفلترة.")
+        print("⚠️ لم يتم العثور على أسهم تطابق شروط الفلترة في هذه الجولة.")
         return
 
     seen_stocks = load_seen()
@@ -271,18 +270,22 @@ def main():
     
     for stock in stocks[:MAX_SHOWN]:
         symbol = stock["symbol"]
+        current_price = stock["price"]
+        
+        # التحقق إذا كان السهم تم إرساله من قبل وهل ارتفع مقارنة بآخر سعر تم تنبيهك به
         if symbol in seen_stocks:
-            continue
+            last_alerted_price = seen_stocks[symbol].get("last_price", 0.0)
+            if current_price <= last_alerted_price:
+                # لم يحدث ارتفاع جديد، تجاهل التنبيه لتكراره
+                continue
 
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
-        
-        # رابط شارت TradingView المباشر للسهم
         tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
         message = (
-            f"🚨 <b>تنبيه سهم جديد</b> ({session_name})\n\n"
+            f"🚨 <b>تنبيه سهم جديد / تحديث ارتفاع</b> ({session_name})\n\n"
             f"🔹 الرمز: <b>{symbol}</b>\n"
-            f"💵 السعر: <b>${stock['price']:.2f}</b>\n"
+            f"💵 السعر الحالي: <b>${current_price:.2f}</b>\n"
             f"📈 التغير: <b>{stock['change_pct']:+.2f}%</b>\n"
             f"📊 الحجم: <b>{stock['volume']:,}</b>\n\n"
             f"📄 <b>أحدث إفصاحات SEC:</b>\n{sec_summary}\n\n"
@@ -292,13 +295,28 @@ def main():
         if send_telegram_message(message):
             seen_stocks[symbol] = {
                 "time": datetime.now(RIYADH).strftime("%H:%M:%S"),
+                "last_price": current_price,
                 "latest_acc": latest_acc
             }
             new_stocks_found += 1
             time.sleep(1)
 
     save_seen(seen_stocks)
-    print(f"✨ تم الانتهاء. إرسال {new_stocks_found} تنبيه جديد.")
+    print(f"✨ تم الانتهاء من دورة الفحص. إرسال {new_stocks_found} تنبيه جديد/محدث.")
+
+# ================================
+# التشغيل المستمر (Loop) كل 3 دقائق
+# ================================
+def main():
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (فحص دوري كل 3 دقائق)...")
+    while True:
+        try:
+            run_scan_cycle()
+        except Exception as e:
+            print(f"❌ حدث خطأ غير متوقع أثناء الدورة: {e}")
+        
+        print("⏳ الانتظار لمدة 3 دقائق للدورة القادمة...\n" + "="*40)
+        time.sleep(180)
 
 if __name__ == "__main__":
     main()
