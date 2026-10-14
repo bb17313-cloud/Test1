@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 CHAT_ID = os.environ.get("CHAT_ID", "ضع_معرف_الشات_هنا")
 
-# مفاتيح المنصات الجديدة
+# مفاتيح المنصات
 TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "ضع_مفتاح_تولف_داتا_هنا")
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هنا")
 
@@ -22,9 +22,6 @@ RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
 MAX_SHOWN = 40   
-
-# قائمة أسهم للمتابعة السريعة وتجربة البوت
-WATCH_LIST = ["AEHL", "TGL", "YRD", "GLND", "LQDA", "GRML", "NIVF", "BDRX", "AAPL", "TSLA", "NVDA", "AMD"]
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -184,73 +181,45 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# جلب البيانات عبر Twelve Data
+# جلب الأسهم الأكثر ارتفاعاً (Top Gainers) ديناميكياً
 # ========================================
-def fetch_from_twelve_data(symbol):
+def fetch_top_gainers():
     if not TWELVE_DATA_KEY or TWELVE_DATA_KEY == "ضع_مفتاح_تولف_داتا_هنا":
-        return None
-    
-    url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVE_DATA_KEY}"
+        print("❌ مفتاح Twelve Data غير متوفر.")
+        return []
+
+    url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&apikey={TWELVE_DATA_KEY}"
+    stocks = []
+
     try:
-        res = requests.get(url, timeout=5)
+        print("🔄 جاري فحص وسحب الأسهم الأكثر ارتفاعاً (Top Gainers) من السوق...")
+        res = requests.get(url, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            if "price" in data:
-                price = float(data.get("price", 0.0))
-                change_pct = float(data.get("percent_change", 0.0))
-                volume = int(data.get("volume", 0) or 0)
-                return {"symbol": symbol, "price": price, "change_pct": change_pct, "volume": volume}
+            values = data.get("values", [])
+            for item in values:
+                symbol = item.get("symbol")
+                price = float(item.get("price", 0.0) or 0.0)
+                change_pct = float(item.get("percent_change", 0.0) or 0.0)
+                volume = int(item.get("volume", 0) or 0)
+                
+                if symbol and price > 0:
+                    # فلترة الشركات التي نسبة صعودها 2% فأكثر
+                    if change_pct >= 2.0:
+                        stocks.append({
+                            "symbol": symbol,
+                            "price": price,
+                            "change_pct": change_pct,
+                            "volume": volume
+                        })
+        else:
+            print(f"⚠️ خطأ في الاستجابة من واجهة Market Movers: {res.status_code}")
     except Exception as e:
-        print(f"⚠️ خطأ Twelve Data لـ {symbol}: {e}")
-    return None
+        print(f"⚠️ خطأ أثناء جلب الـ Top Gainers: {e}")
 
-# ========================================
-# جلب البيانات عبر Finnhub (احتياطي دقيق)
-# ========================================
-def fetch_from_finnhub(symbol):
-    if not FINNHUB_KEY or FINNHUB_KEY == "ضع_مفتاح_فينهب_هنا":
-        return None
-        
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
-    try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            price = float(data.get("c", 0.0))
-            change_pct = float(data.get("dp", 0.0))
-            volume = int(data.get("v", 0) or 0)
-            if price > 0:
-                return {"symbol": symbol, "price": price, "change_pct": change_pct, "volume": volume}
-    except Exception as e:
-        print(f"⚠️ خطأ Finnhub لـ {symbol}: {e}")
-    return None
-
-# ========================================
-# دالة الجلب المتكاملة (بدون أي استبعاد)
-# ========================================
-def fetch_filtered_stocks(session_type):
-    filtered_stocks = []
-    
-    print("🔄 جاري فحص جميع الأسهم المتاحة بدون استبعاد...")
-
-    for symbol in WATCH_LIST:
-        stock_data = fetch_from_twelve_data(symbol)
-        
-        # إذا لم نجد بيانات من Twelve Data، نجرب Finnhub
-        if not stock_data or stock_data["price"] == 0:
-            time.sleep(0.3)
-            stock_data = fetch_from_finnhub(symbol)
-
-        # إذا حصلنا على سهم صالح وبأي حجم أو حتى لو كان الحجم 0، نقبله فوراً ولا نستبعده
-        if stock_data and stock_data["price"] > 0:
-            # شرط الصعود فقط (أكبر من أو يساوي 2%) مع ضمان قبول السهم بغض النظر عن قيمة الحجم
-            if stock_data["change_pct"] >= 2.0:
-                filtered_stocks.append(stock_data)
-        
-        time.sleep(0.2)
-
-    filtered_stocks.sort(key=lambda x: x["change_pct"], reverse=True)
-    return filtered_stocks
+    # ترتيب الأسهم حسب نسبة الصعود تنازلياً (الأعلى صعوداً أولاً)
+    stocks.sort(key=lambda x: x["change_pct"], reverse=True)
+    return stocks
 
 # ================================
 # الدالة التنفيذية لدورة الفحص الواحدة
@@ -263,7 +232,7 @@ def run_scan_cycle():
         print("⏸️ السوق مغلق حالياً، لا توجد تنبيهات للإرسال.")
         return
 
-    stocks = fetch_filtered_stocks(session_key)
+    stocks = fetch_top_gainers()
     if not stocks:
         print("⚠️ لم يتم العثور على أسهم تطابق شروط الصعود في هذه الجولة.")
         return
@@ -276,6 +245,7 @@ def run_scan_cycle():
         current_price = stock["price"]
         volume_val = stock["volume"]
         
+        # عدم تكرار التنبيه إلا إذا ارتفع السهم عن آخر سعر تم إرساله له
         if symbol in seen_stocks:
             last_alerted_price = seen_stocks[symbol].get("last_price", 0.0)
             if current_price <= last_alerted_price:
@@ -284,11 +254,10 @@ def run_scan_cycle():
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
         tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
-        # تنسيق شكل عرض الحجم (إذا كان متوفراً يعرضه بالأرقام، وإذا لم يتوفر يكتب "غير متوفر" بدلًا من وضع رقم وهمي)
-        vol_str = f"{volume_val:,}" if volume_val > 0 else "غير متوفر (يعتمد على المنصة)"
+        vol_str = f"{volume_val:,}" if volume_val > 0 else "غير متوفر"
 
         message = (
-            f"🚨 <b>تنبيه سهم جديد / تحديث ارتفاع</b> ({session_name})\n\n"
+            f"🚨 <b>تنبيه سهم صاعد / تحديث ارتفاع</b> ({session_name})\n\n"
             f"🔹 الرمز: <b>{symbol}</b>\n"
             f"💵 السعر الحالي: <b>${current_price:.2f}</b>\n"
             f"📈 التغير: <b>{stock['change_pct']:+.2f}%</b>\n"
@@ -313,7 +282,7 @@ def run_scan_cycle():
 # التشغيل المستمر (Loop) كل 3 دقائق
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (فحص دوري كل 3 دقائق)...")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (فحص السوق الديناميكي كل 3 دقائق)...")
     while True:
         try:
             run_scan_cycle()
