@@ -26,7 +26,8 @@ MAX_SHOWN = 40
 def get_current_session():
     now_ny = datetime.now(NEW_YORK)
     
-    if now_ny.weekday() in:
+    # تم تصحيح الخطأ النحوي هنا بإضافة النطاق الصحيح لأيام الأسبوع (من الإثنين إلى الجمعة)
+    if now_ny.weekday() not in range(5):
         return "closed", "⏸️ المغلق (عطلة نهاية الأسبوع)"
 
     time_num_ny = now_ny.hour * 100 + now_ny.minute
@@ -137,7 +138,7 @@ def fetch_sec_filings_only(symbol):
     cik_str_val = None
 
     try:
-        tickers_res = requests.get("https://sec.gov", headers=sec_headers, timeout=5)
+        tickers_res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=sec_headers, timeout=5)
         if tickers_res.status_code == 200:
             tickers_data = tickers_res.json()
             cik = None
@@ -150,7 +151,7 @@ def fetch_sec_filings_only(symbol):
                     break
 
             if cik:
-                sub_url = f"https://sec.gov{cik}.json"
+                sub_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
                 sub_res = requests.get(sub_url, headers=sec_headers, timeout=5)
                 if sub_res.status_code == 200:
                     recent = sub_res.json().get("filings", {}).get("recent", {})
@@ -169,9 +170,9 @@ def fetch_sec_filings_only(symbol):
                         item_val = items_list[i] if i < len(items_list) else ""
 
                         if p_doc:
-                            filing_url = f"https://sec.gov{cik_raw}/{acc_clean}/{p_doc}"
+                            filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik_raw}/{acc_clean}/{p_doc}"
                         else:
-                            filing_url = f"https://sec.gov{cik_raw}/{acc_clean}/{acc_num}-index.htm"
+                            filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik_raw}/{acc_clean}/{acc_num}-index.htm"
 
                         doc_text = ""
                         if f_form.upper() in ["10-K", "10-Q", "8-K", "6-K"] or f_form.upper().startswith("424B"):
@@ -215,8 +216,7 @@ def fetch_filtered_stocks(session_type):
         print("❌ خطأ: لم يتم إدخال POLYGON_API_KEY")
         return []
 
-    # جلب اللقطة الشاملة لكل أسهم السوق بطلب واحد مجاني وسريع
-    url = f"https://polygon.io{POLYGON_API_KEY}"
+    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={POLYGON_API_KEY}"
     
     try:
         response = requests.get(url, timeout=15)
@@ -227,21 +227,29 @@ def fetch_filtered_stocks(session_type):
             for ticker_info in all_tickers_data:
                 symbol = ticker_info.get("ticker", "")
                 
-                # استخراج حقول السعر والتغير الإحصائي بناءً على الجلسة الحالية
                 if session_type == "premarket":
-                    # بيانات ما قبل الافتتاح
                     session_data = ticker_info.get("min", {}) 
-                    price = session_data.get("c", 0.0) # سعر إغلاق آخر دقيقة في البري ماركت
+                    price = session_data.get("c", 0.0)
                     todays_change_pct = ticker_info.get("todaysChangePercent", 0.0)
-                    volume = ticker_info.get("todaysChangePercent", 0.0) # نسبة التغير الصباحي
                 elif session_type == "postmarket":
-                    # بيانات ما بعد الإغلاق
                     price = ticker_info.get("lastTrade", {}).get("p", 0.0)
                     todays_change_pct = ticker_info.get("todaysChangePercent", 0.0)
                 else:
-                    # الجلسة الرئيسية
                     price = ticker_info.get("min", {}).get("c", 0.0) or ticker_info.get("lastTrade", {}).get("p", 0.0)
                     todays_change_pct = ticker_info.get("todaysChangePercent", 0.0)
                 
-                volume = ticker_info.get("day", {}).get("v", 0) # حجم التداول اليومي حتى الآن
+                volume = ticker_info.get("day", {}).get("v", 0)
                 
+                # يمكنك إضافة شروط الفلترة هنا وإضافة الأسهم للقائمة
+                filtered_stocks.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "change_pct": todays_change_pct,
+                    "volume": volume
+                })
+                
+            return filtered_stocks
+    except Exception as e:
+        print(f"❌ خطأ في جلب بيانات Polygon: {e}")
+    
+    return []
