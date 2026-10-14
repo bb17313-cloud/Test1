@@ -9,15 +9,16 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # ================================
-# إعدادات التلغرام والبيئة
+# إعدادات التلغرام والبيئة والمفاتيح
 # ================================
 TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 CHAT_ID = os.environ.get("CHAT_ID", "ضع_معرف_الشات_هنا")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "ضع_مفتاح_بوليغون_هنا")
 
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
-MAX_SHOWN = 40   # ← الحد الأقصى للأسهم المسترجعة
+MAX_SHOWN = 40   
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -25,7 +26,6 @@ MAX_SHOWN = 40   # ← الحد الأقصى للأسهم المسترجعة
 def get_current_session():
     now_ny = datetime.now(NEW_YORK)
     
-    # أيام عطلة نهاية الأسبوع في أمريكا (السبت والأحد)
     if now_ny.weekday() in:
         return "closed", "⏸️ المغلق (عطلة نهاية الأسبوع)"
 
@@ -208,148 +208,40 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# جلب وتصفية الأسهم من TradingView API
+# جلب وتصفية الأسهم من Polygon.io Snapshot
 # ========================================
 def fetch_filtered_stocks(session_type):
-    url = "https://tradingview.com"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Content-Type": "application/json"
-    }
+    if not POLYGON_API_KEY or POLYGON_API_KEY == "ضع_مفتاح_بوليغون_هنا":
+        print("❌ خطأ: لم يتم إدخال POLYGON_API_KEY")
+        return []
 
-    # تخصيص الحقول برمجياً بناءً على وضع الجلسة لتتبع الأسعار الصحيحة
-    if session_type == "premarket":
-        price_field = "premarket_close"
-        change_field = "premarket_change"
-        volume_field = "premarket_volume"
-    elif session_type == "postmarket":
-        price_field = "postmarket_close"
-        change_field = "postmarket_change"
-        volume_field = "postmarket_volume"
-    else:
-        price_field = "close"
-        change_field = "change"
-        volume_field = "volume"
-
-    columns = ["name", "description", price_field, change_field, volume_field, "type", "subtype"]
-
-    # طلب الفحص مدمجاً فيه شروط كامل السوق (فحص واحد = طلب واحد)
-    payload = {
-        "filter": [
-            {"left": "type", "operation": "in_range", "right": ["stock"]},       # أسهم فقط
-            {"left": "subtype", "operation": "in_range", "right": ["common"]},   # أسهم عادية
-            {"left": price_field, "operation": "above", "right": 1.0},           # السعر فوق 1 دولار
-            {"left": volume_field, "operation": "above", "right": 50000},        # حجم التداول فوق 50 ألف
-            {"left": change_field, "operation": "above", "right": 3.0}           # نسبة الارتفاع فوق 3% كمثال
-        ],
-        "options": {"lang": "en"},
-        "markets": ["america"],
-        "symbols": {"query": {"types": []}, "tickers": []},
-        "columns": columns,
-        "sort": {"sortBy": change_field, "sortOrder": "desc"},                  # الترتيب من الأعلى ارتفاعاً للأقل
-        "range": [0, MAX_SHOWN]
-    }
-
+    # جلب اللقطة الشاملة لكل أسهم السوق بطلب واحد مجاني وسريع
+    url = f"https://polygon.io{POLYGON_API_KEY}"
+    
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-يُرجى استخدام الرمز البرمجي بحذر.
-if response.status_code == 200:
-result_data = response.json()
-stocks_list = []
-for item in result_data.get("data", []):
-full_ticker = item.get("s", "")
-ticker = full_ticker.split(":")[-1] if ":" in full_ticker else full_ticker
-d_vals = item.get("d", [])
-if len(d_vals) >= 5:
-stocks_list.append({
-"ticker": ticker,
-"company_name": d_vals[1],
-"price": d_vals[2] if d_vals[2] is not None else 0.0,
-"change_percent": d_vals[3] if d_vals[3] is not None else 0.0,
-"volume": d_vals[4] if d_vals[4] is not None else 0
-})
-return stocks_list
-except Exception as e:
-print(f"❌ خطأ في مسح TradingView: {e}")
-return []
-
-================================
-
-
-إرسال التنبيهات إلى تلغرام
-
-
-================================
-
-def send_telegram_message(text):
-if not TOKEN or not CHAT_ID:
-print("⚠️ إعدادات التلغرام غير مكتملة. تم تخطي الإرسال.")
-return
-url = f"telegram.org{TOKEN}/sendMessage"
-payload = {
-"chat_id": CHAT_ID,
-"text": text,
-"parse_mode": "HTML",
-"disable_web_page_preview": True
-}
-try:
-res = requests.post(url, json=payload, timeout=10)
-if res.status_code != 200:
-print(f"❌ فشل إرسال رسالة التلغرام: {res.text}")
-except Exception as e:
-print(f"❌ خطأ أثناء الاتصال بالتلغرام: {e}")
-
-================================
-
-
-المحرك الرئيسي للفحص والربط
-
-
-================================
-
-def run_radar():
-session_key, session_desc = get_current_session()
-print(f"⏳ الجلسة الحالية: {session_desc}")
-if session_key == "closed":
-print("⏸️ السوق مغلق حالياً. سيتم إيقاف الفحص تلقائياً.")
-return
-# 1. تحميل سجل الأسهم التي تم فحصها وإرسالها مسبقاً في هذه الجلسة
-seen_stocks = load_seen()
-# 2. فحص كامل السوق بطلب واحد جلب سريع
-print("🔍 جاري جلب ومسح كامل السوق الأمريكي عبر خوادم التصفية السريعة...")
-matched_stocks = fetch_filtered_stocks(session_key)
-print(f"✅ العثور على {len(matched_stocks)} سهم يطابق الشروط الأساسية.")
-any_new_stock = False
-# 3. معالجة الأسهم وفلترة الأسهم الجديدة فقط
-for stock in matched_stocks:
-symbol = stock["ticker"]
-# جلب إفصاحات SEC للسهم لمعرفة آخر رقم مستند (Accession)
-sec_summary, cik, latest_acc = fetch_sec_filings_only(symbol)
-# إذا تم رؤية هذا السهم مسبقاً بنفس آخر إفصاح، يتم تخطيه لمنع التكرار
-if symbol in seen_stocks and seen_stocks[symbol] == latest_acc:
-continue
-# تحديث السجل للسهم الجديد
-seen_stocks[symbol] = latest_acc
-any_new_stock = True
-# 4. بناء رسالة التنبيه الاحترافية للتصاعد المفاجئ
-message_text = (
-f"🚨 رادار السوق الأمريكي - سهم جديد مطابق!\n\n"
-f"🎫 الشركة: {stock['company_name']} ({symbol})\n"
-f"💰 السعر الحالي: {stock['price']:.2f}$\n"
-f"📈 نسبة التغير: {stock['change_percent']:.2f}%\n"
-f"📊 حجم التداول: {stock['volume']:,}\n"
-f"⏰ الجلسة: {session_desc}\n\n"
-f"📋 آخر إفصاحات SEC المعتمدة:\n{sec_summary}\n\n"
-f"📅 توقيت الرصد: {datetime.now(RIYADH).strftime('%Y-%m-%d %H:%M:%S')} بتوقيت الرياض"
-)
-# إرسال الرسالة فوراً عبر التلغرام
-print(f"🚀 إرسال تنبيه للسهم المكتشف حديثاً: {symbol}")
-send_telegram_message(message_text)
-time.sleep(1) # تأخير بسيط لتجنب حظر التلغرام عند إرسال رسائل متعددة متتالية
-# 5. حفظ السجل المحدث إذا تم اكتشاف أي جديد
-if any_new_stock:
-save_seen(seen_stocks)
-else:
-print("👍 لا توجد أسهم جديدة تطابق الشروط لم يتم إرسالها من قبل.")
-if name == "main":
-run_radar()
+        response = requests.get(url, timeout=15)
+        if response.status_code == 200:
+            all_tickers_data = response.json().get("tickers", [])
+            filtered_stocks = []
+            
+            for ticker_info in all_tickers_data:
+                symbol = ticker_info.get("ticker", "")
+                
+                # استخراج حقول السعر والتغير الإحصائي بناءً على الجلسة الحالية
+                if session_type == "premarket":
+                    # بيانات ما قبل الافتتاح
+                    session_data = ticker_info.get("min", {}) 
+                    price = session_data.get("c", 0.0) # سعر إغلاق آخر دقيقة في البري ماركت
+                    todays_change_pct = ticker_info.get("todaysChangePercent", 0.0)
+                    volume = ticker_info.get("todaysChangePercent", 0.0) # نسبة التغير الصباحي
+                elif session_type == "postmarket":
+                    # بيانات ما بعد الإغلاق
+                    price = ticker_info.get("lastTrade", {}).get("p", 0.0)
+                    todays_change_pct = ticker_info.get("todaysChangePercent", 0.0)
+                else:
+                    # الجلسة الرئيسية
+                    price = ticker_info.get("min", {}).get("c", 0.0) or ticker_info.get("lastTrade", {}).get("p", 0.0)
+                    todays_change_pct = ticker_info.get("todaysChangePercent", 0.0)
+                
+                volume = ticker_info.get("day", {}).get("v", 0) # حجم التداول اليومي حتى الآن
+                
