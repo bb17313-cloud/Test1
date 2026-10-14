@@ -23,7 +23,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
 MAX_SHOWN = 40   
 
-# قائمة أسهم افتراضية للمتابعة السريعة (تجنباً لتجاوز حد الطلبات المجانية في الباقة)
+# قائمة أسهم للمتابعة السريعة وتجربة البوت
 WATCH_LIST = ["AEHL", "TGL", "YRD", "GLND", "LQDA", "GRML", "NIVF", "BDRX", "AAPL", "TSLA", "NVDA", "AMD"]
 
 # ================================
@@ -206,7 +206,7 @@ def fetch_from_twelve_data(symbol):
     return None
 
 # ========================================
-# جلب البيانات عبر Finnhub (المصدر الاحتياطي Fallback)
+# جلب البيانات عبر Finnhub (المصدر الاحتياطي)
 # ========================================
 def fetch_from_finnhub(symbol):
     if not FINNHUB_KEY or FINNHUB_KEY == "ضع_مفتاح_فينهب_هنا":
@@ -217,11 +217,10 @@ def fetch_from_finnhub(symbol):
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            # Finnhub يعيد: c (current price), dp (percent change), pc (previous close)
             price = float(data.get("c", 0.0))
             change_pct = float(data.get("dp", 0.0))
             if price > 0:
-                return {"symbol": symbol, "price": price, "change_pct": change_pct, "volume": 50000} # تقديري للحجم إذا لم يتوفر
+                return {"symbol": symbol, "price": price, "change_pct": change_pct, "volume": 50000}
     except Exception as e:
         print(f"⚠️ خطأ Finnhub لـ {symbol}: {e}")
     return None
@@ -238,7 +237,6 @@ def fetch_filtered_stocks(session_type):
     for symbol in WATCH_LIST:
         stock_data = fetch_from_twelve_data(symbol)
         
-        # إذا فشلت Twelve Data، نتحول تلقائياً إلى Finnhub (Fallback)
         if not stock_data:
             time.sleep(0.5)
             stock_data = fetch_from_finnhub(symbol)
@@ -247,7 +245,7 @@ def fetch_filtered_stocks(session_type):
             if stock_data["change_pct"] >= 2.0 and stock_data["volume"] >= vol_limit:
                 filtered_stocks.append(stock_data)
         
-        time.sleep(0.2) # مهلة بسيطة بين الطلبات لتجنب الحظر
+        time.sleep(0.2)
 
     filtered_stocks.sort(key=lambda x: x["change_pct"], reverse=True)
     return filtered_stocks
@@ -277,6 +275,9 @@ def main():
             continue
 
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
+        
+        # رابط شارت TradingView المباشر للسهم
+        tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
         message = (
             f"🚨 <b>تنبيه سهم جديد</b> ({session_name})\n\n"
@@ -284,7 +285,8 @@ def main():
             f"💵 السعر: <b>${stock['price']:.2f}</b>\n"
             f"📈 التغير: <b>{stock['change_pct']:+.2f}%</b>\n"
             f"📊 الحجم: <b>{stock['volume']:,}</b>\n\n"
-            f"📄 <b>أحدث إفصاحات SEC:</b>\n{sec_summary}"
+            f"📄 <b>أحدث إفصاحات SEC:</b>\n{sec_summary}\n\n"
+            f"📈 <a href='{tv_url}'>فتح الشارت على TradingView</a>"
         )
 
         if send_telegram_message(message):
