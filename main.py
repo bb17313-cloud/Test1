@@ -5,7 +5,7 @@ import html
 import time
 import requests
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ================================
@@ -329,18 +329,55 @@ def run_scan_cycle():
     print(f"✨ تم الانتهاء من دورة الفحص. إرسال {new_stocks_found} تنبيه جديد/محدث.")
 
 # ================================
-# التشغيل المستمر (Loop) كل 3 دقائق
+# حساب الوقت المتبقي لبداية Pre-Market القادم
+# ================================
+def seconds_until_next_premarket():
+    now_ny = datetime.now(NEW_YORK)
+    
+    # نبدأ من اليوم الحالي
+    target = now_ny.replace(hour=4, minute=0, second=0, microsecond=0)
+    
+    # إذا فات وقت الـ 4 صباحاً اليوم، نروح لليوم التالي
+    if now_ny >= target:
+        target = target + timedelta(days=1)
+    
+    # نتخطى السبت والأحد
+    while target.weekday() >= 5:  # 5=السبت، 6=الأحد
+        target = target + timedelta(days=1)
+    
+    delta = target - now_ny
+    return max(int(delta.total_seconds()), 60)  # على الأقل دقيقة واحدة
+
+
+# ================================
+# التشغيل المستمر (Loop)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (فحص السوق الشامل كل 3 دقائق)...")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (يعمل فقط خلال الجلسات الثلاث + فحص كل 5 دقائق)...")
+    
     while True:
         try:
+            session_key, session_name = get_current_session()
+            print(f"🔍 الجلسة الحالية: {session_name}")
+
+            if session_key == "closed":
+                sleep_secs = seconds_until_next_premarket()
+                hours = sleep_secs // 3600
+                minutes = (sleep_secs % 3600) // 60
+                print(f"⏸️ السوق مغلق (ليل أو ويكند). سيتوقف تماماً ويعاود عند بداية Pre-Market.")
+                print(f"⏳ النوم لمدة تقريبية: {hours} ساعة و {minutes} دقيقة...\n" + "="*40)
+                time.sleep(sleep_secs)
+                continue
+
+            # الجلسة مفتوحة → نفذ الفحص
             run_scan_cycle()
+
         except Exception as e:
             print(f"❌ حدث خطأ غير متوقع أثناء الدورة: {e}")
-        
-        print("⏳ الانتظار لمدة 3 دقائق للدورة القادمة...\n" + "="*40)
-        time.sleep(180)
+
+        print("⏳ الانتظار لمدة 5 دقائق للدورة القادمة...\n" + "="*40)
+        time.sleep(300)  # 5 دقائق
+
 
 if __name__ == "__main__":
     main()
