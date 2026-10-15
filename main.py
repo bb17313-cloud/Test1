@@ -1,10 +1,7 @@
 import os
 import json
-import re
-import html
 import time
 import requests
-import urllib.parse
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -14,14 +11,13 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 CHAT_ID = os.environ.get("CHAT_ID", "ضع_معرف_الشات_هنا")
 
-# مفاتيح المنصات
 TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "ضع_مفتاح_تولف_داتا_هنا")
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هنا")
 
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
-MAX_SHOWN = 20   # نرسل فقط أفضل 20 سهم
+MAX_SHOWN = 20
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -96,17 +92,9 @@ def send_telegram_message(text):
 # ================================
 # تحليل ووصف إفصاحات SEC
 # ================================
-def get_sec_description(f_form, item_val="", doc_text=""):
+def get_sec_description(f_form):
     f_upper = f_form.upper()
-    text_lower = doc_text.lower() if doc_text else ""
-
     if f_upper == "10-K":
-        if "item 1a" in text_lower or "risk factors" in text_lower:
-            return "عوامل المخاطرة"
-        elif "item 7" in text_lower:
-            return "تحليل الإدارة للوضع المالي"
-        elif "item 8" in text_lower:
-            return "القوائم المالية"
         return "التقرير المالي السنوي"
     elif f_upper == "10-Q":
         return "القوائم المالية الفصلية"
@@ -181,19 +169,25 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# المسح الشامل - Top 50 Gainers كل دورة
+# المسح الشامل - Twelve Data أولاً + Finnhub كاحتياطي
 # ========================================
 def fetch_all_market_stocks():
     all_stocks_dict = {}
 
+    # 1. محاولة Twelve Data أولاً
     if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
         url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&outputsize=50&apikey={TWELVE_DATA_KEY}"
         try:
-            print("🔄 جاري سحب Top 50 Gainers من Twelve Data...")
+            print("🔄 [Twelve Data] جاري سحب Top 50 Gainers...")
             res = requests.get(url, timeout=12)
+            print(f"📡 [Twelve Data] Status: {res.status_code}")
+
             if res.status_code == 200:
                 data = res.json()
-                for item in data.get("values", []):
+                values = data.get("values", [])
+                print(f"📦 [Twelve Data] عدد الأسهم الراجعة: {len(values)}")
+
+                for item in values:
                     symbol = item.get("symbol")
                     price = float(item.get("last", item.get("price", 0.0)) or 0.0)
                     change_pct = float(item.get("percent_change", 0.0) or 0.0)
@@ -205,18 +199,57 @@ def fetch_all_market_stocks():
                             "change_pct": change_pct,
                             "volume": volume
                         }
-                print(f"✅ تم جلب {len(all_stocks_dict)} سهم من Top Gainers")
+                print(f"✅ [Twelve Data] تم تخزين {len(all_stocks_dict)} سهم")
             else:
-                print(f"⚠️ فشل جلب Market Movers - Status: {res.status_code}")
+                print(f"❌ [Twelve Data] فشل - الرد: {res.text[:250]}")
         except Exception as e:
-            print(f"⚠️ خطأ في سحب Market Movers: {e}")
+            print(f"⚠️ [Twelve Data] خطأ: {e}")
 
-    # تصفية الأسهم ≥ 2% + ترتيب تنازلي + أخذ أفضل 20 فقط
+    # 2. إذا Twelve Data فشل أو رجع قليل → Finnhub
+    if len(all_stocks_dict) < 5 and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
+        print("🔄 [Finnhub] التحول إلى Finnhub كاحتياطي...")
+        
+        fallback_list = [
+            "AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "GOOGL",
+            "PLTR", "SOFI", "NIO", "RIVN", "LCID", "MARA", "RIOT", "COIN",
+            "GME", "AMC", "BB", "NOK", "SNDL", "TLRY", "CGC", "ACB",
+            "SPCE", "DKNG", "PENN", "F", "BAC", "C", "INTC", "MU",
+            "SNAP", "PINS", "UBER", "LYFT", "ABNB", "SQ", "PYPL", "SHOP"
+        ]
+
+        for symbol in fallback_list:
+            try:
+                fh_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+                res = requests.get(fh_url, timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    price = float(data.get("c", 0.0) or 0.0)
+                    change_pct = float(data.get("dp", 0.0) or 0.0)
+                    if price > 0 and change_pct >= 2.0:
+                        all_stocks_dict[symbol] = {
+                            "symbol": symbol,
+                            "price": price,
+                            "change_pct": change_pct,
+                            "volume": 0
+                        }
+                time.sleep(0.15)
+            except:
+                pass
+
+        print(f"✅ [Finnhub] تم إضافة {len(all_stocks_dict)} سهم من الاحتياطي")
+
+    # الفلترة النهائية
     filtered_list = [s for s in all_stocks_dict.values() if s["change_pct"] >= 2.0]
     filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
     top_20 = filtered_list[:MAX_SHOWN]
+
+    print(f"🎯 عدد الأسهم ≥ 2%: {len(filtered_list)} | سيتم إرسال أفضل {len(top_20)}")
     
-    print(f"🎯 تم اختيار أفضل {len(top_20)} سهم تنطبق عليهم الشروط (≥ 2%)")
+    if top_20:
+        print("أعلى الأسهم حالياً:")
+        for s in top_20[:5]:
+            print(f"   → {s['symbol']}: {s['change_pct']:+.2f}% | ${s['price']:.2f}")
+
     return top_20
 
 # ================================
@@ -287,7 +320,7 @@ def seconds_until_next_premarket():
     if now_ny >= target:
         target = target + timedelta(days=1)
     
-    while target.weekday() >= 5:  # تخطي السبت والأحد
+    while target.weekday() >= 5:
         target = target + timedelta(days=1)
     
     delta = target - now_ny
@@ -297,7 +330,7 @@ def seconds_until_next_premarket():
 # التشغيل المستمر (Loop)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (Top 50 كل 5 دقائق + أفضل 20 سهم)")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (Top 50 + Finnhub Fallback + أفضل 20 سهم)")
     
     while True:
         try:
@@ -313,14 +346,13 @@ def main():
                 time.sleep(sleep_secs)
                 continue
 
-            # الجلسة مفتوحة → نفذ الفحص
             run_scan_cycle()
 
         except Exception as e:
             print(f"❌ حدث خطأ غير متوقع أثناء الدورة: {e}")
 
         print("⏳ الانتظار لمدة 5 دقائق للدورة القادمة...\n" + "="*40)
-        time.sleep(300)  # 5 دقائق
+        time.sleep(300)
 
 if __name__ == "__main__":
     main()
