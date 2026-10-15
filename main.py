@@ -21,16 +21,7 @@ FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هن
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
-MAX_SHOWN = 50   
-
-# قائمة واسعة ومتنوعة من الأسهم النشطة والساخنة لضمان التغطية الفورية مع المسح العام
-BACKUP_WATCH_LIST = [
-    "GENK", "DFNS", "TDIC", "BSP", "AMTD", "TC", 
-    "AEHL", "TGL", "YRD", "GLND", "LQDA", "GRML", "NIVF", "BDRX", 
-    "AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "GME", "AMC",
-    "PLTR", "NIO", "COIN", "MARA", "RIOT", "SAVA", "VERU", "APLD", "CENN",
-    "MULN", "BBBY", "FFIE", "PROG", "BBIG", "CEI", "SOS", "INDV", "INPX"
-]
+MAX_SHOWN = 20   # نرسل فقط أفضل 20 سهم
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -190,22 +181,21 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# دمج المسح الشامل (Market Movers + Watchlist واسعة)
+# المسح الشامل - Top 50 Gainers كل دورة
 # ========================================
 def fetch_all_market_stocks():
     all_stocks_dict = {}
 
-    # 1. جلب الـ Top Gainers عبر Twelve Data
     if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
-        url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&apikey={TWELVE_DATA_KEY}"
+        url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&outputsize=50&apikey={TWELVE_DATA_KEY}"
         try:
-            print("🔄 جاري سحب الـ Top Gainers من Twelve Data...")
-            res = requests.get(url, timeout=10)
+            print("🔄 جاري سحب Top 50 Gainers من Twelve Data...")
+            res = requests.get(url, timeout=12)
             if res.status_code == 200:
                 data = res.json()
                 for item in data.get("values", []):
                     symbol = item.get("symbol")
-                    price = float(item.get("price", 0.0) or 0.0)
+                    price = float(item.get("last", item.get("price", 0.0)) or 0.0)
                     change_pct = float(item.get("percent_change", 0.0) or 0.0)
                     volume = int(item.get("volume", 0) or 0)
                     if symbol and price > 0:
@@ -215,61 +205,19 @@ def fetch_all_market_stocks():
                             "change_pct": change_pct,
                             "volume": volume
                         }
+                print(f"✅ تم جلب {len(all_stocks_dict)} سهم من Top Gainers")
+            else:
+                print(f"⚠️ فشل جلب Market Movers - Status: {res.status_code}")
         except Exception as e:
             print(f"⚠️ خطأ في سحب Market Movers: {e}")
 
-    # 2. فحص قائمة الأسهم الواسعة لتغطية أي سهم متحرك لم يظهر في القائمة العامة
-    print("🔄 جاري فحص الأسهم الإضافية لضمان عدم تفويت أي فرصة...")
-    for symbol in BACKUP_WATCH_LIST:
-        if symbol in all_stocks_dict:
-            continue
-        
-        # محاولة عبر Twelve Data لكل سهم فردي إذا لزم الأمر
-        if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
-            try:
-                single_url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVE_DATA_KEY}"
-                res = requests.get(single_url, timeout=4)
-                if res.status_code == 200:
-                    data = res.json()
-                    if "price" in data:
-                        price = float(data.get("price", 0.0) or 0.0)
-                        change_pct = float(data.get("percent_change", 0.0) or 0.0)
-                        volume = int(data.get("volume", 0) or 0)
-                        if price > 0:
-                            all_stocks_dict[symbol] = {
-                                "symbol": symbol,
-                                "price": price,
-                                "change_pct": change_pct,
-                                "volume": volume
-                            }
-                time.sleep(0.2)
-            except:
-                pass
-
-        # أو عبر Finnhub كاحتياطي سريع
-        if symbol not in all_stocks_dict and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
-            try:
-                fh_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
-                res = requests.get(fh_url, timeout=4)
-                if res.status_code == 200:
-                    data = res.json()
-                    price = float(data.get("c", 0.0) or 0.0)
-                    change_pct = float(data.get("dp", 0.0) or 0.0)
-                    if price > 0:
-                        all_stocks_dict[symbol] = {
-                            "symbol": symbol,
-                            "price": price,
-                            "change_pct": change_pct,
-                            "volume": 0
-                        }
-                time.sleep(0.2)
-            except:
-                pass
-
-    # تصفية الأسهم التي حققت صعوداً بنسبة 2% فأكثر فقط
+    # تصفية الأسهم ≥ 2% + ترتيب تنازلي + أخذ أفضل 20 فقط
     filtered_list = [s for s in all_stocks_dict.values() if s["change_pct"] >= 2.0]
     filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
-    return filtered_list
+    top_20 = filtered_list[:MAX_SHOWN]
+    
+    print(f"🎯 تم اختيار أفضل {len(top_20)} سهم تنطبق عليهم الشروط (≥ 2%)")
+    return top_20
 
 # ================================
 # الدالة التنفيذية لدورة الفحص الواحدة
@@ -290,12 +238,12 @@ def run_scan_cycle():
     seen_stocks = load_seen()
     new_stocks_found = 0
     
-    for stock in stocks[:MAX_SHOWN]:
+    for stock in stocks:
         symbol = stock["symbol"]
         current_price = stock["price"]
         volume_val = stock["volume"]
         
-        # عدم التكرار إلا في حال ارتفاع السهم أكثر عن آخر سعر تم إرساله
+        # عدم التكرار إلا إذا ارتفع السعر أكثر من آخر تنبيه
         if symbol in seen_stocks:
             last_alerted_price = seen_stocks[symbol].get("last_price", 0.0)
             if current_price <= last_alerted_price:
@@ -334,26 +282,22 @@ def run_scan_cycle():
 def seconds_until_next_premarket():
     now_ny = datetime.now(NEW_YORK)
     
-    # نبدأ من اليوم الحالي
     target = now_ny.replace(hour=4, minute=0, second=0, microsecond=0)
     
-    # إذا فات وقت الـ 4 صباحاً اليوم، نروح لليوم التالي
     if now_ny >= target:
         target = target + timedelta(days=1)
     
-    # نتخطى السبت والأحد
-    while target.weekday() >= 5:  # 5=السبت، 6=الأحد
+    while target.weekday() >= 5:  # تخطي السبت والأحد
         target = target + timedelta(days=1)
     
     delta = target - now_ny
-    return max(int(delta.total_seconds()), 60)  # على الأقل دقيقة واحدة
-
+    return max(int(delta.total_seconds()), 60)
 
 # ================================
 # التشغيل المستمر (Loop)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (يعمل فقط خلال الجلسات الثلاث + فحص كل 5 دقائق)...")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (Top 50 كل 5 دقائق + أفضل 20 سهم)")
     
     while True:
         try:
@@ -377,7 +321,6 @@ def main():
 
         print("⏳ الانتظار لمدة 5 دقائق للدورة القادمة...\n" + "="*40)
         time.sleep(300)  # 5 دقائق
-
 
 if __name__ == "__main__":
     main()
