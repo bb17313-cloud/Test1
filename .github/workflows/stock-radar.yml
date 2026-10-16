@@ -1,17 +1,13 @@
-name: stocks-alert
+name: stock-radar
 
 on:
   schedule:
-‎    # الجلسات الثلاث بتوقيت نيويورك: 04:00 - 20:00 (Pre 04:00 / Main 09:30 / Post 16:00)
-‎    # النافذة بتوقيت UTC تغطي الصيف والشتاء: من 08:00 حتى 01:59 اليوم التالي
-‎    # أيام الأسبوع الأمريكية (الاثنين-الجمعة) = UTC الاثنين 08:00 حتى السبت 01:59
     - cron: "*/5 8-23 * * 1-5"
     - cron: "*/5 0-1 * * 2-6"
   workflow_dispatch:
 
-‎# منع تداخل دورتين، دورة واحدة فقط في كل مرة
 concurrency:
-  group: stocks-alert
+  group: stock-radar
   cancel-in-progress: false
 
 permissions:
@@ -21,7 +17,6 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 4
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,9 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-‎      # استرجاع سجل التنبيهات (seen_stocks.json) من آخر دورة
       - name: Restore seen_stocks.json
-        id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: seen_stocks.json
@@ -50,10 +43,9 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python main.py
 
-‎      # حفظ السجل حتى لو فشلت الدورة
       - name: Save seen_stocks.json
         if: always() && hashFiles('seen_stocks.json') != ''
         uses: actions/cache/save@v4
         with:
           path: seen_stocks.json
-          key: seen-stocks-${{ gi
+          key: seen-stocks-${{ github.run_id }}
