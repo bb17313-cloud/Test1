@@ -37,7 +37,11 @@ jobs:
 
     - name: Commit and push changes if seen_stocks.json changed
       run: |
-        git config --global user.name "GitHub Actions Bot"
-        git config --global user.email "actions@github.com"
-        git add seen_stocks.json
-        git diff --quiet && git diff --cached --quiet || (git commit -m "Update seen stocks record [skip ci]" && git push)
+        if [ -f "seen_stocks.json" ]; then
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add seen_stocks.json
+          git diff --quiet && git diff --cached --quiet || (git commit -m "Update seen stocks record [skip ci]" && git push)
+        else
+          echo "seen_stocks.json does not exist yet, skipping commit."
+        fi
