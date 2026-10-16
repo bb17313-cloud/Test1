@@ -13,14 +13,15 @@ CHAT_ID = os.environ.get("CHAT_ID", "ضع_معرف_الشات_هنا")
 
 TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "ضع_مفتاح_تولف_داتا_هنا")
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هنا")
+FMP_KEY = os.environ.get("FMP_API_KEY", "ضع_مفتاح_FMP_هنا")
 
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
-MAX_CANDIDATES = 45          # أعلى 45 سهم ارتفاع
-MAX_SHOWN = 25               # نرسل فقط أفضل 25
-MIN_VOLUME = 5000            # حجم أدنى 5 آلاف
-REALERT_THRESHOLD = 1.5      # إعادة التنبيه فقط إذا ارتفع التغير +1.5% عن الرسالة الأولى
+MAX_CANDIDATES = 45
+MAX_SHOWN = 25
+MIN_VOLUME = 5000
+REALERT_THRESHOLD = 1.5
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -172,53 +173,80 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# المسح الشامل - Twelve Data أولاً + Finnhub كاحتياطي
+# المسح الشامل - FMP أولاً + Twelve Data + Finnhub
 # ========================================
 def fetch_all_market_stocks():
     all_stocks_dict = {}
 
-    # 1. محاولة Twelve Data أولاً (نجلب أكبر عدد ممكن)
-    if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
-        url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&outputsize=50&apikey={TWELVE_DATA_KEY}"
+    # 1. المصدر الأقوى: Financial Modeling Prep
+    if FMP_KEY and FMP_KEY != "ضع_مفتاح_FMP_هنا":
         try:
-            print("🔄 [Twelve Data] جاري سحب Top Gainers...")
+            print("🔄 [FMP] جاري سحب Top Gainers الحقيقي...")
+            url = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={FMP_KEY}"
             res = requests.get(url, timeout=12)
-            print(f"📡 [Twelve Data] Status: {res.status_code}")
+            print(f"📡 [FMP] Status: {res.status_code}")
 
             if res.status_code == 200:
                 data = res.json()
-                values = data.get("values", [])
-                print(f"📦 [Twelve Data] عدد الأسهم الراجعة: {len(values)}")
+                print(f"📦 [FMP] عدد الأسهم الراجعة: {len(data)}")
 
-                for item in values:
+                for item in data:
                     symbol = item.get("symbol")
-                    price = float(item.get("last", item.get("price", 0.0)) or 0.0)
-                    change_pct = float(item.get("percent_change", 0.0) or 0.0)
+                    price = float(item.get("price", 0) or 0)
+                    change_pct = float(item.get("changesPercentage", 0) or 0)
                     volume = int(item.get("volume", 0) or 0)
-                    if symbol and price > 0 and volume >= MIN_VOLUME:
+
+                    if symbol and price > 0 and volume >= MIN_VOLUME and change_pct >= 5.0:
                         all_stocks_dict[symbol] = {
                             "symbol": symbol,
                             "price": price,
                             "change_pct": change_pct,
                             "volume": volume
                         }
-                print(f"✅ [Twelve Data] تم تخزين {len(all_stocks_dict)} سهم (بعد فلتر الحجم ≥ {MIN_VOLUME})")
-            else:
-                print(f"❌ [Twelve Data] فشل - الرد: {res.text[:250]}")
+                print(f"✅ [FMP] تم تخزين {len(all_stocks_dict)} سهم قوي")
+        except Exception as e:
+            print(f"⚠️ [FMP] خطأ: {e}")
+
+    # 2. Twelve Data كاحتياطي
+    if len(all_stocks_dict) < 15 and TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
+        url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&outputsize=50&apikey={TWELVE_DATA_KEY}"
+        try:
+            print("🔄 [Twelve Data] جاري السحب كاحتياطي...")
+            res = requests.get(url, timeout=12)
+            if res.status_code == 200:
+                values = res.json().get("values", [])
+                for item in values:
+                    symbol = item.get("symbol")
+                    price = float(item.get("last", item.get("price", 0.0)) or 0.0)
+                    change_pct = float(item.get("percent_change", 0.0) or 0.0)
+                    volume = int(item.get("volume", 0) or 0)
+                    if symbol and price > 0 and volume >= MIN_VOLUME and change_pct >= 4.0:
+                        if symbol not in all_stocks_dict:
+                            all_stocks_dict[symbol] = {
+                                "symbol": symbol,
+                                "price": price,
+                                "change_pct": change_pct,
+                                "volume": volume
+                            }
+                print(f"✅ [Twelve Data] أضاف أسهم. الإجمالي الآن: {len(all_stocks_dict)}")
         except Exception as e:
             print(f"⚠️ [Twelve Data] خطأ: {e}")
 
-    # 2. إذا Twelve Data فشل أو رجع قليل → Finnhub
+    # 3. Finnhub كاحتياطي أخير + قائمة Runners موسعة
     if len(all_stocks_dict) < 10 and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
-        print("🔄 [Finnhub] التحول إلى Finnhub كاحتياطي...")
-        
+        print("🔄 [Finnhub] التحول إلى قائمة Runners موسعة...")
+
         fallback_list = [
+            "ZTG", "XLAB", "HODO", "TCRT", "SGRX", "SITC", "JBDI", "WORX", "SCKT",
+            "NMRA", "FFR", "GRI", "YMT", "MODD", "ATII", "SLSN", "NWGL", "SMX",
+            "BLNE", "MRKR", "IAM", "NA", "QXL", "JAGX", "RUBI", "NCPL", "PMI",
             "AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "GOOGL",
             "PLTR", "SOFI", "NIO", "RIVN", "LCID", "MARA", "RIOT", "COIN",
             "GME", "AMC", "BB", "NOK", "SNDL", "TLRY", "CGC", "ACB",
             "SPCE", "DKNG", "PENN", "F", "BAC", "C", "INTC", "MU",
             "SNAP", "PINS", "UBER", "LYFT", "ABNB", "SQ", "PYPL", "SHOP",
-            "SMCI", "ARM", "AVGO", "QCOM", "CRM", "NFLX", "DIS", "BA"
+            "SMCI", "ARM", "AVGO", "QCOM", "CRM", "NFLX", "DIS", "BA",
+            "OPEN", "RKT", "UWMC", "SOUN", "BBAI", "ACHR", "JOBY", "LILM"
         ]
 
         for symbol in fallback_list:
@@ -229,32 +257,32 @@ def fetch_all_market_stocks():
                     data = res.json()
                     price = float(data.get("c", 0.0) or 0.0)
                     change_pct = float(data.get("dp", 0.0) or 0.0)
-                    # Finnhub لا يعطي حجم دقيق هنا، نتخطى شرط الحجم في الاحتياطي فقط
-                    if price > 0 and change_pct > 0:
-                        all_stocks_dict[symbol] = {
-                            "symbol": symbol,
-                            "price": price,
-                            "change_pct": change_pct,
-                            "volume": 0
-                        }
+                    if price > 0 and change_pct >= 5.0:
+                        if symbol not in all_stocks_dict:
+                            all_stocks_dict[symbol] = {
+                                "symbol": symbol,
+                                "price": price,
+                                "change_pct": change_pct,
+                                "volume": 0
+                            }
                 time.sleep(0.12)
             except:
                 pass
 
-        print(f"✅ [Finnhub] تم إضافة أسهم من الاحتياطي. الإجمالي الآن: {len(all_stocks_dict)}")
+        print(f"✅ [Finnhub] الإجمالي بعد الاحتياطي: {len(all_stocks_dict)}")
 
-    # ترتيب حسب أعلى ارتفاع → نأخذ أعلى 45 مرشح → ثم أفضل 25 فقط
+    # ترتيب حسب أعلى ارتفاع
     filtered_list = list(all_stocks_dict.values())
     filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
-    
-    candidates = filtered_list[:MAX_CANDIDATES]   # أعلى 45
-    top_25 = candidates[:MAX_SHOWN]               # نرسل أفضل 25 فقط
 
-    print(f"🎯 أعلى {len(candidates)} مرشح (حجم ≥ {MIN_VOLUME}) | سيتم متابعة أفضل {len(top_25)}")
+    candidates = filtered_list[:MAX_CANDIDATES]
+    top_25 = candidates[:MAX_SHOWN]
+
+    print(f"🎯 أعلى {len(candidates)} مرشح | سيتم متابعة أفضل {len(top_25)}")
     
     if top_25:
         print("أعلى الأسهم حالياً:")
-        for s in top_25[:5]:
+        for s in top_25[:8]:
             print(f"   → {s['symbol']}: {s['change_pct']:+.2f}% | ${s['price']:.2f} | Vol: {s['volume']:,}")
 
     return top_25
@@ -284,14 +312,11 @@ def run_scan_cycle():
         current_change = stock["change_pct"]
         volume_val = stock["volume"]
         
-        # --- منطق عدم التكرار ---
-        # لا نكرر الرسالة إلا إذا ارتفع التغير بنسبة +1.5% عن الرسالة الأولى
         if symbol in seen_stocks:
             first_change = seen_stocks[symbol].get("first_change_pct", 0.0)
             if current_change < (first_change + REALERT_THRESHOLD):
-                continue   # لم يصل للحد المطلوب → نتخطى
+                continue
 
-        # --- جلب إفصاحات SEC ---
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
         tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
@@ -308,9 +333,7 @@ def run_scan_cycle():
         )
 
         if send_telegram_message(message):
-            # نحفظ بيانات الرسالة الأولى (أو نحدثها)
             if symbol not in seen_stocks:
-                # أول مرة → نحفظ نسبة التغير الأصلية
                 seen_stocks[symbol] = {
                     "time": datetime.now(RIYADH).strftime("%H:%M:%S"),
                     "first_change_pct": current_change,
@@ -318,11 +341,9 @@ def run_scan_cycle():
                     "latest_acc": latest_acc
                 }
             else:
-                # تحديث فقط (وصل لـ +1.5)
                 seen_stocks[symbol]["time"] = datetime.now(RIYADH).strftime("%H:%M:%S")
                 seen_stocks[symbol]["last_price"] = current_price
                 seen_stocks[symbol]["latest_acc"] = latest_acc
-                # نترك first_change_pct كما هو (من الرسالة الأولى)
 
             new_stocks_found += 1
             time.sleep(1)
@@ -331,51 +352,25 @@ def run_scan_cycle():
     print(f"✨ تم الانتهاء من دورة الفحص. إرسال {new_stocks_found} تنبيه جديد/محدث.")
 
 # ================================
-# حساب الوقت المتبقي لبداية Pre-Market القادم
-# ================================
-def seconds_until_next_premarket():
-    now_ny = datetime.now(NEW_YORK)
-    
-    target = now_ny.replace(hour=4, minute=0, second=0, microsecond=0)
-    
-    if now_ny >= target:
-        target = target + timedelta(days=1)
-    
-    while target.weekday() >= 5:
-        target = target + timedelta(days=1)
-    
-    delta = target - now_ny
-    return max(int(delta.total_seconds()), 60)
-
-# ================================
-# التشغيل المستمر (Loop)
+# التشغيل (دورة واحدة فقط - مناسب لـ GitHub Actions)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (دورة واحدة)")
     print(f"📌 الشروط: حجم ≥ {MIN_VOLUME} | أعلى {MAX_CANDIDATES} مرشح → أفضل {MAX_SHOWN}")
     print(f"📌 إعادة التنبيه فقط عند ارتفاع +{REALERT_THRESHOLD}% عن الرسالة الأولى")
     
-    while True:
-        try:
-            session_key, session_name = get_current_session()
-            print(f"🔍 الجلسة الحالية: {session_name}")
+    try:
+        session_key, session_name = get_current_session()
+        print(f"🔍 الجلسة الحالية: {session_name}")
 
-            if session_key == "closed":
-                sleep_secs = seconds_until_next_premarket()
-                hours = sleep_secs // 3600
-                minutes = (sleep_secs % 3600) // 60
-                print(f"⏸️ السوق مغلق (ليل أو ويكند). سيتوقف تماماً ويعاود عند بداية Pre-Market.")
-                print(f"⏳ النوم لمدة تقريبية: {hours} ساعة و {minutes} دقيقة...\n" + "="*40)
-                time.sleep(sleep_secs)
-                continue
+        if session_key == "closed":
+            print("⏸️ السوق مغلق حالياً، لا توجد تنبيهات.")
+            return
 
-            run_scan_cycle()
+        run_scan_cycle()
 
-        except Exception as e:
-            print(f"❌ حدث خطأ غير متوقع أثناء الدورة: {e}")
-
-        print("⏳ الانتظار لمدة 5 دقائق للدورة القادمة...\n" + "="*40)
-        time.sleep(300)
+    except Exception as e:
+        print(f"❌ حدث خطأ غير متوقع: {e}")
 
 if __name__ == "__main__":
     main()
