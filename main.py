@@ -2,6 +2,7 @@ import os
 import json
 import time
 import requests
+import yfinance as yf
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -19,8 +20,41 @@ NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
 MAX_CANDIDATES = 45
 MAX_SHOWN = 25
-MIN_VOLUME = 1000          # خففنا الحجم
 REALERT_THRESHOLD = 1.5
+
+# الأسواق المطلوبة فقط
+ALLOWED_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS"}
+
+# قواميس ترجمة القطاعات والصناعات الأساسية إلى العربية
+SECTOR_TRANSLATIONS = {
+    "Technology": "التكنولوجيا",
+    "Healthcare": "الرعاية الصحية",
+    "Financial Services": "الخدمات المالية",
+    "Consumer Cyclical": "الاستهلاك الدوري",
+    "Consumer Defensive": "الاستهلاك الدفاعي",
+    "Energy": "الطاقة",
+    "Industrials": "الصناعة",
+    "Basic Materials": "المواد الأساسية",
+    "Real Estate": "العقارات",
+    "Utilities": "المرافق العامة",
+    "Communication Services": "خدمات الاتصالات"
+}
+
+INDUSTRY_TRANSLATIONS = {
+    "Biotechnology": "التكنولوجيا الحيوية",
+    "Software - Infrastructure": "برمجيات - البنية التحتية",
+    "Software - Application": "برمجيات - التطبيقات",
+    "Semiconductors": "أشباه الموصلات",
+    "Banks - Regional": "بنوك إقليمية",
+    "Oil & Gas E&P": "استكشاف وإنتاج النفط والغاز",
+    "Medical Devices": "الأجهزة الطبية",
+    "Pharmaceuticals": "الأدوية"
+}
+
+def translate_to_arabic(text, trans_dict):
+    if not text:
+        return "غير متوفر"
+    return trans_dict.get(text, text)
 
 # ================================
 # إدارة جلسات السوق
@@ -91,6 +125,31 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"❌ خطأ في الاتصال بتيليجرام: {e}")
         return False
+
+# ================================
+# جلب معلومات السهم (القطاع والصناعة والبورصة)
+# ================================
+def get_stock_details(symbol):
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        exchange = info.get("exchange", "").upper()
+        
+        # التأكد من الأسواق المسموحة (نازداك، نيويورك، أمكس)
+        if not any(ex in exchange for ex in ["NASDAQ", "NYSE", "AMEX", "NYQ", "NMS", "NGM"]):
+            # محاولة التحقق عبر جلب معلومات الرمز من أداة بديلة إذا لزم الأمر
+            pass
+
+        sector_en = info.get("sector", "غير متوفر")
+        industry_en = info.get("industry", "غير متوفر")
+        
+        sector_ar = translate_to_arabic(sector_en, SECTOR_TRANSLATIONS)
+        industry_ar = translate_to_arabic(industry_en, INDUSTRY_TRANSLATIONS)
+        
+        return exchange, sector_ar, industry_ar
+    except Exception as e:
+        print(f"⚠️ خطأ في جلب بيانات yfinance لـ {symbol}: {e}")
+        return "UNKNOWN", "غير متوفر", "غير متوفر"
 
 # ================================
 # إفصاحات SEC
@@ -172,7 +231,7 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# المسح الشامل - Alpaca فقط
+# المسح الشامل - Alpaca والفلترة للأسواق الثلاثة
 # ========================================
 def fetch_all_market_stocks():
     all_stocks_dict = {}
@@ -189,50 +248,40 @@ def fetch_all_market_stocks():
             "APCA-API-SECRET-KEY": ALPACA_SECRET
         }
         res = requests.get(url, headers=headers, timeout=12)
-        print(f"📡 [Alpaca] Status: {res.status_code}")
 
         if res.status_code == 200:
             data = res.json()
             gainers = data.get("gainers", [])
-            print(f"📦 [Alpaca] عدد الأسهم الراجعة: {len(gainers)}")
-
-            # طباعة مثال عشان نعرف شكل البيانات
-            if gainers:
-                print("مثال أول سهم:", gainers[0])
 
             for item in gainers:
                 symbol = item.get("symbol")
                 price = float(item.get("price", 0) or 0)
                 change_pct = float(item.get("percent_change", 0) or 0)
-                volume = int(item.get("volume", 0) or 0)
 
-                # فلتر مخفف
                 if symbol and price > 0 and change_pct >= 1.5:
-                    all_stocks_dict[symbol] = {
-                        "symbol": symbol,
-                        "price": price,
-                        "change_pct": change_pct,
-                        "volume": volume
-                    }
-            print(f"✅ [Alpaca] تم تخزين {len(all_stocks_dict)} سهم")
+                    # جلب تفاصيل السوق والقطاع والصناعة
+                    exchange, sector, industry = get_stock_details(symbol)
+                    
+                    # فلترة الأسواق الثلاثة (Nasdaq, NYSE, AMEX)
+                    if any(ex in exchange.upper() for ex in ["NASDAQ", "NYSE", "AMEX", "NYQ", "NMS", "NGM"]):
+                        all_stocks_dict[symbol] = {
+                            "symbol": symbol,
+                            "price": price,
+                            "change_pct": change_pct,
+                            "sector": sector,
+                            "industry": industry
+                        }
+            print(f"✅ [Alpaca] تم تخزين {len(all_stocks_dict)} سهم بعد تطبيق فلاتر الأسواق الثلاثة")
         else:
             print(f"❌ [Alpaca] فشل - الرد: {res.text[:400]}")
     except Exception as e:
         print(f"⚠️ [Alpaca] خطأ: {e}")
 
-    # ترتيب وأخذ أفضل 25
     filtered_list = list(all_stocks_dict.values())
     filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
 
     candidates = filtered_list[:MAX_CANDIDATES]
     top_25 = candidates[:MAX_SHOWN]
-
-    print(f"🎯 أعلى {len(candidates)} مرشح | سيتم متابعة أفضل {len(top_25)}")
-    
-    if top_25:
-        print("أعلى الأسهم حالياً:")
-        for s in top_25[:8]:
-            print(f"   → {s['symbol']}: {s['change_pct']:+.2f}% | ${s['price']:.2f} | Vol: {s['volume']:,}")
 
     return top_25
 
@@ -259,7 +308,8 @@ def run_scan_cycle():
         symbol = stock["symbol"]
         current_price = stock["price"]
         current_change = stock["change_pct"]
-        volume_val = stock["volume"]
+        sector = stock["sector"]
+        industry = stock["industry"]
         
         if symbol in seen_stocks:
             first_change = seen_stocks[symbol].get("first_change_pct", 0.0)
@@ -269,14 +319,12 @@ def run_scan_cycle():
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
         tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
-        vol_str = f"{volume_val:,}" if volume_val > 0 else "غير متوفر"
-
         message = (
             f"🚨 <b>تنبيه سهم صاعد / تحديث ارتفاع</b> ({session_name})\n\n"
             f"🔹 الرمز: <b>{symbol}</b>\n"
+            f"🏭 القطاع: {sector} | الصناعة: {industry}\n"
             f"💵 السعر الحالي: <b>${current_price:.2f}</b>\n"
-            f"📈 التغير: <b>{current_change:+.2f}%</b>\n"
-            f"📊 الحجم: <b>{vol_str}</b>\n\n"
+            f"📈 التغير: <b>{current_change:+.2f}%</b>\n\n"
             f"📄 <b>أحدث إفصاحات SEC:</b>\n{sec_summary}\n\n"
             f"📈 <a href='{tv_url}'>فتح الشارت على TradingView</a>"
         )
@@ -304,10 +352,7 @@ def run_scan_cycle():
 # التشغيل (دورة واحدة)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (Alpaca فقط)")
-    print(f"📌 الشروط: حجم ≥ {MIN_VOLUME} | أعلى {MAX_CANDIDATES} → أفضل {MAX_SHOWN}")
-    print(f"📌 إعادة التنبيه فقط عند ارتفاع +{REALERT_THRESHOLD}% عن الرسالة الأولى")
-    
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (الأسواق الثلاثة فقط)")
     try:
         session_key, session_name = get_current_session()
         print(f"🔍 الجلسة الحالية: {session_name}")
