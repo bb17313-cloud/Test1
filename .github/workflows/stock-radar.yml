@@ -1,259 +1,60 @@
-
-
-# ========================================
-
-# جلب الأسهم من Yahoo Finance مع معالجة 429
-
-# ========================================
-
-def fetch_all_market_stocks():
-
-    all_stocks_dict = {}
-
-    url = (
-
-        "https://query1.finance.yahoo.com/v1/finance/"
-
-        "screener/predefined/saved"
-
-    )
-
-    params = {
-
-        "formatted": "true",
-
-        "scrIds": "day_gainers",
-
-        "count": MAX_CANDIDATES,
-
-        "start": 0,
-
-        "sortField": "percentchange",
-
-        "sortType": "DESC"
-
-    }
-
-    headers = {
-
-        "User-Agent": (
-
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-
-            "Chrome/131.0.0.0 Safari/537.36"
-
-        ),
-
-        "Accept": "application/json",
-
-        "Accept-Language": "en-US,en;q=0.9",
-
-        "Connection": "keep-alive"
-
-    }
-
-    max_attempts = 3
-
-    try:
-
-        with requests.Session() as session:
-
-            session.headers.update(headers)
-
-            for attempt in range(max_attempts):
-
-                print(
-
-                    f"🔄 [Yahoo Finance] محاولة "
-
-                    f"{attempt + 1}/{max_attempts} لجلب الأسهم..."
-
-                )
-
-                try:
-
-                    res = session.get(
-
-                        url,
-
-                        params=params,
-
-                        timeout=20
-
-                    )
-
-                    if res.status_code == 429:
-
-                        if attempt == max_attempts - 1:
-
-                            print(
-
-                                "❌ [Yahoo Finance] استمر خطأ 429 "
-
-                                "بعد جميع المحاولات. "
-
-                                "سيتم الانتظار حتى دورة الفحص التالية."
-
-                            )
-
-                            return []
-
-                        retry_after = res.headers.get("Retry-After")
-
-                        try:
-
-                            wait_seconds = float(retry_after)
-
-                        except (TypeError, ValueError):
-
-                            wait_seconds = 20 * (2 ** attempt)
-
-                        # تجنب الانتظار القصير جدًا
-
-                        wait_seconds = max(5, wait_seconds)
-
-                        print(
-
-                            f"⏳ Yahoo Finance رفض الطلب (429). "
-
-                            f"إعادة المحاولة بعد {wait_seconds:.0f} ثانية."
-
-                        )
-
-                        time.sleep(wait_seconds)
-
-                        continue
-
-                    res.raise_for_status()
-
-                    data = res.json()
-
-                    break
-
-                except requests.exceptions.HTTPError as e:
-
-                    print(f"❌ [Yahoo Finance] خطأ HTTP: {e}")
-
-                    return []
-
-                except requests.exceptions.RequestException as e:
-
-                    if attempt == max_attempts - 1:
-
-                        print(
-
-                            f"❌ [Yahoo Finance] فشل الاتصال بعد "
-
-                            f"{max_attempts} محاولات: {e}"
-
-                        )
-
-                        return []
-
-                    wait_seconds = 5 * (2 ** attempt)
-
-                    print(
-
-                        f"⚠️ خطأ اتصال: {e}. "
-
-                        f"إعادة المحاولة بعد {wait_seconds} ثوانٍ."
-
-                    )
-
-                    time.sleep(wait_seconds)
-
-            else:
-
-                return []
-
-        results = (
-
-            data.get("finance", {})
-
-            .get("result", [])
-
-        )
-
-        if not results:
-
-            print("⚠️ Yahoo Finance لم يُرجع نتائج.")
-
-            return []
-
-        quotes = results[0].get("quotes", [])
-
-        for item in quotes:
-
-            symbol = item.get("symbol")
-
-            price = item.get("regularMarketPrice")
-
-            change_pct = item.get("regularMarketChangePercent")
-
-            if price is None or not symbol:
-
-                continue
-
-            try:
-
-                price = float(price)
-
-                change_pct = float(change_pct or 0)
-
-            except (TypeError, ValueError):
-
-                continue
-
-            if price <= 0:
-
-                continue
-
-            exchange = (
-
-                item.get("fullExchangeName")
-
-                or item.get("exchange")
-
-                or "غير محدد"
-
-            )
-
-            all_stocks_dict[symbol] = {
-
-                "symbol": symbol,
-
-                "price": price,
-
-                "change_pct": change_pct,
-
-                "exchange": exchange
-
-            }
-
-        print(
-
-            f"✅ [Yahoo Finance] تم جلب "
-
-            f"{len(all_stocks_dict)} سهم."
-
-        )
-
-    except Exception as e:
-
-        print(f"❌ [Yahoo Finance] خطأ غير متوقع: {e}")
-
-        return []
-
-    filtered_list = list(all_stocks_dict.values())
-
-    filtered_list.sort(
-
-        key=lambda x: x["change_pct"],
-
-        reverse=True
-
-    )
-
-    return filtered_list[:MAX_SHOWN]
+name: stocks-alert
+
+on:
+  schedule:
+    # الجلسات الثلاث بتوقيت نيويورك: 04:00 - 20:00 (Pre 04:00 / Main 09:30 / Post 16:00)
+    # النافذة بتوقيت UTC تغطي الصيف والشتاء: من 08:00 حتى 01:59 اليوم التالي
+    # أيام الأسبوع الأمريكية (الاثنين-الجمعة) = UTC الاثنين 08:00 حتى السبت 01:59
+    - cron: "*/5 8-23 * * 1-5"
+    - cron: "*/5 0-1 * * 2-6"
+  workflow_dispatch:
+
+# منع تداخل دورتين، دورة واحدة فقط في كل مرة
+concurrency:
+  group: stocks-alert
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # استرجاع سجل التنبيهات (seen_stocks.json) من آخر دورة
+      - name: Restore seen_stocks.json
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: seen_stocks.json
+          key: seen-stocks-${{ github.run_id }}
+          restore-keys: |
+            seen-stocks-
+
+      - name: Run scanner
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python main.py
+
+      # حفظ السجل حتى لو فشلت الدورة
+      - name: Save seen_stocks.json
+        if: always() && hashFiles('seen_stocks.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: seen_stocks.json
+          key: seen-stocks-${{ github.run_id }}
