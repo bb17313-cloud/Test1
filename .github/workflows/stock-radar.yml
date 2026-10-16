@@ -1,85 +1,259 @@
 
 
-name: Stock Radar Bot
+# ========================================
 
-on:
+# جلب الأسهم من Yahoo Finance مع معالجة 429
 
-  # كل 5 دقائق خلال أوقات التداول (UTC)
+# ========================================
 
-  schedule:
+def fetch_all_market_stocks():
 
-    - cron: '*/5 8-23 * * 1-5'
+    all_stocks_dict = {}
 
-  # تشغيل يدوي
+    url = (
 
-  workflow_dispatch:
+        "https://query1.finance.yahoo.com/v1/finance/"
 
-jobs:
+        "screener/predefined/saved"
 
-  run-bot:
+    )
 
-    runs-on: ubuntu-latest
+    params = {
 
-    permissions:
+        "formatted": "true",
 
-      contents: write
+        "scrIds": "day_gainers",
 
-    steps:
+        "count": MAX_CANDIDATES,
 
-    - name: Checkout repository
+        "start": 0,
 
-      uses: actions/checkout@v4
+        "sortField": "percentchange",
 
-    - name: Set up Python
+        "sortType": "DESC"
 
-      uses: actions/setup-python@v5
+    }
 
-      with:
+    headers = {
 
-        python-version: '3.11'
+        "User-Agent": (
 
-    - name: Install dependencies
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 
-      run: |
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
 
-        python -m pip install --upgrade pip
+            "Chrome/131.0.0.0 Safari/537.36"
 
-        pip install requests
+        ),
 
-    - name: Run Stock Radar Bot
+        "Accept": "application/json",
 
-      env:
+        "Accept-Language": "en-US,en;q=0.9",
 
-        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        "Connection": "keep-alive"
 
-        CHAT_ID: ${{ secrets.CHAT_ID }}
+    }
 
-      run: |
+    max_attempts = 3
 
-        python main.py
+    try:
 
-    - name: Commit and push changes if seen_stocks.json changed
+        with requests.Session() as session:
 
-      run: |
+            session.headers.update(headers)
 
-        if [ -f "seen_stocks.json" ]; then
+            for attempt in range(max_attempts):
 
-          git config user.name "GitHub Actions Bot"
+                print(
 
-          git config user.email "actions@github.com"
+                    f"🔄 [Yahoo Finance] محاولة "
 
-          git add seen_stocks.json
+                    f"{attempt + 1}/{max_attempts} لجلب الأسهم..."
 
-          git diff --cached --quiet || (
+                )
 
-            git commit -m "Update seen stocks record [skip ci]" &&
+                try:
 
-            git push
+                    res = session.get(
 
-          )
+                        url,
 
-        else
+                        params=params,
 
-          echo "seen_stocks.json does not exist yet, skipping commit."
+                        timeout=20
 
-        fi
+                    )
+
+                    if res.status_code == 429:
+
+                        if attempt == max_attempts - 1:
+
+                            print(
+
+                                "❌ [Yahoo Finance] استمر خطأ 429 "
+
+                                "بعد جميع المحاولات. "
+
+                                "سيتم الانتظار حتى دورة الفحص التالية."
+
+                            )
+
+                            return []
+
+                        retry_after = res.headers.get("Retry-After")
+
+                        try:
+
+                            wait_seconds = float(retry_after)
+
+                        except (TypeError, ValueError):
+
+                            wait_seconds = 20 * (2 ** attempt)
+
+                        # تجنب الانتظار القصير جدًا
+
+                        wait_seconds = max(5, wait_seconds)
+
+                        print(
+
+                            f"⏳ Yahoo Finance رفض الطلب (429). "
+
+                            f"إعادة المحاولة بعد {wait_seconds:.0f} ثانية."
+
+                        )
+
+                        time.sleep(wait_seconds)
+
+                        continue
+
+                    res.raise_for_status()
+
+                    data = res.json()
+
+                    break
+
+                except requests.exceptions.HTTPError as e:
+
+                    print(f"❌ [Yahoo Finance] خطأ HTTP: {e}")
+
+                    return []
+
+                except requests.exceptions.RequestException as e:
+
+                    if attempt == max_attempts - 1:
+
+                        print(
+
+                            f"❌ [Yahoo Finance] فشل الاتصال بعد "
+
+                            f"{max_attempts} محاولات: {e}"
+
+                        )
+
+                        return []
+
+                    wait_seconds = 5 * (2 ** attempt)
+
+                    print(
+
+                        f"⚠️ خطأ اتصال: {e}. "
+
+                        f"إعادة المحاولة بعد {wait_seconds} ثوانٍ."
+
+                    )
+
+                    time.sleep(wait_seconds)
+
+            else:
+
+                return []
+
+        results = (
+
+            data.get("finance", {})
+
+            .get("result", [])
+
+        )
+
+        if not results:
+
+            print("⚠️ Yahoo Finance لم يُرجع نتائج.")
+
+            return []
+
+        quotes = results[0].get("quotes", [])
+
+        for item in quotes:
+
+            symbol = item.get("symbol")
+
+            price = item.get("regularMarketPrice")
+
+            change_pct = item.get("regularMarketChangePercent")
+
+            if price is None or not symbol:
+
+                continue
+
+            try:
+
+                price = float(price)
+
+                change_pct = float(change_pct or 0)
+
+            except (TypeError, ValueError):
+
+                continue
+
+            if price <= 0:
+
+                continue
+
+            exchange = (
+
+                item.get("fullExchangeName")
+
+                or item.get("exchange")
+
+                or "غير محدد"
+
+            )
+
+            all_stocks_dict[symbol] = {
+
+                "symbol": symbol,
+
+                "price": price,
+
+                "change_pct": change_pct,
+
+                "exchange": exchange
+
+            }
+
+        print(
+
+            f"✅ [Yahoo Finance] تم جلب "
+
+            f"{len(all_stocks_dict)} سهم."
+
+        )
+
+    except Exception as e:
+
+        print(f"❌ [Yahoo Finance] خطأ غير متوقع: {e}")
+
+        return []
+
+    filtered_list = list(all_stocks_dict.values())
+
+    filtered_list.sort(
+
+        key=lambda x: x["change_pct"],
+
+        reverse=True
+
+    )
+
+    return filtered_list[:MAX_SHOWN]
