@@ -11,9 +11,8 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 CHAT_ID = os.environ.get("CHAT_ID", "ضع_معرف_الشات_هنا")
 
-TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "ضع_مفتاح_تولف_داتا_هنا")
-FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هنا")
-FMP_KEY = os.environ.get("FMP_API_KEY", "ضع_مفتاح_FMP_هنا")
+ALPACA_KEY = os.environ.get("ALPACA_API_KEY", "ضع_مفتاح_البكا_هنا")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY", "ضع_السر_هنا")
 
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
@@ -24,7 +23,7 @@ MIN_VOLUME = 5000
 REALERT_THRESHOLD = 1.5
 
 # ================================
-# إدارة جلسات السوق الثلاث
+# إدارة جلسات السوق
 # ================================
 def get_current_session():
     now_ny = datetime.now(NEW_YORK)
@@ -94,7 +93,7 @@ def send_telegram_message(text):
         return False
 
 # ================================
-# تحليل ووصف إفصاحات SEC
+# إفصاحات SEC
 # ================================
 def get_sec_description(f_form):
     f_upper = f_form.upper()
@@ -173,105 +172,50 @@ def fetch_sec_filings_only(symbol):
     return sec_summary, cik_str_val, latest_accession
 
 # ========================================
-# المسح الشامل - FMP أولاً + Twelve Data + Finnhub
+# المسح الشامل - Alpaca فقط
 # ========================================
 def fetch_all_market_stocks():
     all_stocks_dict = {}
 
-    # 1. المصدر الأقوى: Financial Modeling Prep
-    if FMP_KEY and FMP_KEY != "ضع_مفتاح_FMP_هنا":
-        try:
-            print("🔄 [FMP] جاري سحب Top Gainers الحقيقي...")
-            url = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={FMP_KEY}"
-            res = requests.get(url, timeout=12)
-            print(f"📡 [FMP] Status: {res.status_code}")
+    if not ALPACA_KEY or ALPACA_KEY == "ضع_مفتاح_البكا_هنا" or not ALPACA_SECRET or ALPACA_SECRET == "ضع_السر_هنا":
+        print("❌ مفاتيح Alpaca غير موجودة")
+        return []
 
-            if res.status_code == 200:
-                data = res.json()
-                print(f"📦 [FMP] عدد الأسهم الراجعة: {len(data)}")
+    try:
+        print("🔄 [Alpaca] جاري سحب Top Gainers...")
+        url = "https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50"
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET
+        }
+        res = requests.get(url, headers=headers, timeout=12)
+        print(f"📡 [Alpaca] Status: {res.status_code}")
 
-                for item in data:
-                    symbol = item.get("symbol")
-                    price = float(item.get("price", 0) or 0)
-                    change_pct = float(item.get("changesPercentage", 0) or 0)
-                    volume = int(item.get("volume", 0) or 0)
+        if res.status_code == 200:
+            data = res.json()
+            gainers = data.get("gainers", [])
+            print(f"📦 [Alpaca] عدد الأسهم الراجعة: {len(gainers)}")
 
-                    if symbol and price > 0 and volume >= MIN_VOLUME and change_pct >= 5.0:
-                        all_stocks_dict[symbol] = {
-                            "symbol": symbol,
-                            "price": price,
-                            "change_pct": change_pct,
-                            "volume": volume
-                        }
-                print(f"✅ [FMP] تم تخزين {len(all_stocks_dict)} سهم قوي")
-        except Exception as e:
-            print(f"⚠️ [FMP] خطأ: {e}")
+            for item in gainers:
+                symbol = item.get("symbol")
+                price = float(item.get("price", 0) or 0)
+                change_pct = float(item.get("percent_change", 0) or 0)
+                volume = int(item.get("volume", 0) or 0)
 
-    # 2. Twelve Data كاحتياطي
-    if len(all_stocks_dict) < 15 and TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
-        url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&outputsize=50&apikey={TWELVE_DATA_KEY}"
-        try:
-            print("🔄 [Twelve Data] جاري السحب كاحتياطي...")
-            res = requests.get(url, timeout=12)
-            if res.status_code == 200:
-                values = res.json().get("values", [])
-                for item in values:
-                    symbol = item.get("symbol")
-                    price = float(item.get("last", item.get("price", 0.0)) or 0.0)
-                    change_pct = float(item.get("percent_change", 0.0) or 0.0)
-                    volume = int(item.get("volume", 0) or 0)
-                    if symbol and price > 0 and volume >= MIN_VOLUME and change_pct >= 4.0:
-                        if symbol not in all_stocks_dict:
-                            all_stocks_dict[symbol] = {
-                                "symbol": symbol,
-                                "price": price,
-                                "change_pct": change_pct,
-                                "volume": volume
-                            }
-                print(f"✅ [Twelve Data] أضاف أسهم. الإجمالي الآن: {len(all_stocks_dict)}")
-        except Exception as e:
-            print(f"⚠️ [Twelve Data] خطأ: {e}")
+                if symbol and price > 0 and volume >= MIN_VOLUME and change_pct >= 3.0:
+                    all_stocks_dict[symbol] = {
+                        "symbol": symbol,
+                        "price": price,
+                        "change_pct": change_pct,
+                        "volume": volume
+                    }
+            print(f"✅ [Alpaca] تم تخزين {len(all_stocks_dict)} سهم")
+        else:
+            print(f"❌ [Alpaca] فشل - الرد: {res.text[:400]}")
+    except Exception as e:
+        print(f"⚠️ [Alpaca] خطأ: {e}")
 
-    # 3. Finnhub كاحتياطي أخير + قائمة Runners موسعة
-    if len(all_stocks_dict) < 10 and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
-        print("🔄 [Finnhub] التحول إلى قائمة Runners موسعة...")
-
-        fallback_list = [
-            "ZTG", "XLAB", "HODO", "TCRT", "SGRX", "SITC", "JBDI", "WORX", "SCKT",
-            "NMRA", "FFR", "GRI", "YMT", "MODD", "ATII", "SLSN", "NWGL", "SMX",
-            "BLNE", "MRKR", "IAM", "NA", "QXL", "JAGX", "RUBI", "NCPL", "PMI",
-            "AAPL", "TSLA", "NVDA", "AMD", "META", "AMZN", "MSFT", "GOOGL",
-            "PLTR", "SOFI", "NIO", "RIVN", "LCID", "MARA", "RIOT", "COIN",
-            "GME", "AMC", "BB", "NOK", "SNDL", "TLRY", "CGC", "ACB",
-            "SPCE", "DKNG", "PENN", "F", "BAC", "C", "INTC", "MU",
-            "SNAP", "PINS", "UBER", "LYFT", "ABNB", "SQ", "PYPL", "SHOP",
-            "SMCI", "ARM", "AVGO", "QCOM", "CRM", "NFLX", "DIS", "BA",
-            "OPEN", "RKT", "UWMC", "SOUN", "BBAI", "ACHR", "JOBY", "LILM"
-        ]
-
-        for symbol in fallback_list:
-            try:
-                fh_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
-                res = requests.get(fh_url, timeout=5)
-                if res.status_code == 200:
-                    data = res.json()
-                    price = float(data.get("c", 0.0) or 0.0)
-                    change_pct = float(data.get("dp", 0.0) or 0.0)
-                    if price > 0 and change_pct >= 5.0:
-                        if symbol not in all_stocks_dict:
-                            all_stocks_dict[symbol] = {
-                                "symbol": symbol,
-                                "price": price,
-                                "change_pct": change_pct,
-                                "volume": 0
-                            }
-                time.sleep(0.12)
-            except:
-                pass
-
-        print(f"✅ [Finnhub] الإجمالي بعد الاحتياطي: {len(all_stocks_dict)}")
-
-    # ترتيب حسب أعلى ارتفاع
+    # ترتيب وأخذ أفضل 25
     filtered_list = list(all_stocks_dict.values())
     filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
 
@@ -288,7 +232,7 @@ def fetch_all_market_stocks():
     return top_25
 
 # ================================
-# الدالة التنفيذية لدورة الفحص الواحدة
+# دورة الفحص
 # ================================
 def run_scan_cycle():
     session_key, session_name = get_current_session()
@@ -352,11 +296,11 @@ def run_scan_cycle():
     print(f"✨ تم الانتهاء من دورة الفحص. إرسال {new_stocks_found} تنبيه جديد/محدث.")
 
 # ================================
-# التشغيل (دورة واحدة فقط - مناسب لـ GitHub Actions)
+# التشغيل (دورة واحدة)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (دورة واحدة)")
-    print(f"📌 الشروط: حجم ≥ {MIN_VOLUME} | أعلى {MAX_CANDIDATES} مرشح → أفضل {MAX_SHOWN}")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم (Alpaca فقط)")
+    print(f"📌 الشروط: حجم ≥ {MIN_VOLUME} | أعلى {MAX_CANDIDATES} → أفضل {MAX_SHOWN}")
     print(f"📌 إعادة التنبيه فقط عند ارتفاع +{REALERT_THRESHOLD}% عن الرسالة الأولى")
     
     try:
