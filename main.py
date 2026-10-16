@@ -17,7 +17,10 @@ FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "ضع_مفتاح_فينهب_هن
 RIYADH = ZoneInfo("Asia/Riyadh")
 NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
-MAX_SHOWN = 20
+MAX_CANDIDATES = 45          # أعلى 45 سهم ارتفاع
+MAX_SHOWN = 25               # نرسل فقط أفضل 25
+MIN_VOLUME = 5000            # حجم أدنى 5 آلاف
+REALERT_THRESHOLD = 1.5      # إعادة التنبيه فقط إذا ارتفع التغير +1.5% عن الرسالة الأولى
 
 # ================================
 # إدارة جلسات السوق الثلاث
@@ -174,11 +177,11 @@ def fetch_sec_filings_only(symbol):
 def fetch_all_market_stocks():
     all_stocks_dict = {}
 
-    # 1. محاولة Twelve Data أولاً
+    # 1. محاولة Twelve Data أولاً (نجلب أكبر عدد ممكن)
     if TWELVE_DATA_KEY and TWELVE_DATA_KEY != "ضع_مفتاح_تولف_داتا_هنا":
         url = f"https://api.twelvedata.com/market_movers/stocks?direction=gainers&outputsize=50&apikey={TWELVE_DATA_KEY}"
         try:
-            print("🔄 [Twelve Data] جاري سحب Top 50 Gainers...")
+            print("🔄 [Twelve Data] جاري سحب Top Gainers...")
             res = requests.get(url, timeout=12)
             print(f"📡 [Twelve Data] Status: {res.status_code}")
 
@@ -192,21 +195,21 @@ def fetch_all_market_stocks():
                     price = float(item.get("last", item.get("price", 0.0)) or 0.0)
                     change_pct = float(item.get("percent_change", 0.0) or 0.0)
                     volume = int(item.get("volume", 0) or 0)
-                    if symbol and price > 0:
+                    if symbol and price > 0 and volume >= MIN_VOLUME:
                         all_stocks_dict[symbol] = {
                             "symbol": symbol,
                             "price": price,
                             "change_pct": change_pct,
                             "volume": volume
                         }
-                print(f"✅ [Twelve Data] تم تخزين {len(all_stocks_dict)} سهم")
+                print(f"✅ [Twelve Data] تم تخزين {len(all_stocks_dict)} سهم (بعد فلتر الحجم ≥ {MIN_VOLUME})")
             else:
                 print(f"❌ [Twelve Data] فشل - الرد: {res.text[:250]}")
         except Exception as e:
             print(f"⚠️ [Twelve Data] خطأ: {e}")
 
     # 2. إذا Twelve Data فشل أو رجع قليل → Finnhub
-    if len(all_stocks_dict) < 5 and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
+    if len(all_stocks_dict) < 10 and FINNHUB_KEY and FINNHUB_KEY != "ضع_مفتاح_فينهب_هنا":
         print("🔄 [Finnhub] التحول إلى Finnhub كاحتياطي...")
         
         fallback_list = [
@@ -214,7 +217,8 @@ def fetch_all_market_stocks():
             "PLTR", "SOFI", "NIO", "RIVN", "LCID", "MARA", "RIOT", "COIN",
             "GME", "AMC", "BB", "NOK", "SNDL", "TLRY", "CGC", "ACB",
             "SPCE", "DKNG", "PENN", "F", "BAC", "C", "INTC", "MU",
-            "SNAP", "PINS", "UBER", "LYFT", "ABNB", "SQ", "PYPL", "SHOP"
+            "SNAP", "PINS", "UBER", "LYFT", "ABNB", "SQ", "PYPL", "SHOP",
+            "SMCI", "ARM", "AVGO", "QCOM", "CRM", "NFLX", "DIS", "BA"
         ]
 
         for symbol in fallback_list:
@@ -225,32 +229,35 @@ def fetch_all_market_stocks():
                     data = res.json()
                     price = float(data.get("c", 0.0) or 0.0)
                     change_pct = float(data.get("dp", 0.0) or 0.0)
-                    if price > 0 and change_pct >= 2.0:
+                    # Finnhub لا يعطي حجم دقيق هنا، نتخطى شرط الحجم في الاحتياطي فقط
+                    if price > 0 and change_pct > 0:
                         all_stocks_dict[symbol] = {
                             "symbol": symbol,
                             "price": price,
                             "change_pct": change_pct,
                             "volume": 0
                         }
-                time.sleep(0.15)
+                time.sleep(0.12)
             except:
                 pass
 
-        print(f"✅ [Finnhub] تم إضافة {len(all_stocks_dict)} سهم من الاحتياطي")
+        print(f"✅ [Finnhub] تم إضافة أسهم من الاحتياطي. الإجمالي الآن: {len(all_stocks_dict)}")
 
-    # الفلترة النهائية
-    filtered_list = [s for s in all_stocks_dict.values() if s["change_pct"] >= 2.0]
+    # ترتيب حسب أعلى ارتفاع → نأخذ أعلى 45 مرشح → ثم أفضل 25 فقط
+    filtered_list = list(all_stocks_dict.values())
     filtered_list.sort(key=lambda x: x["change_pct"], reverse=True)
-    top_20 = filtered_list[:MAX_SHOWN]
-
-    print(f"🎯 عدد الأسهم ≥ 2%: {len(filtered_list)} | سيتم إرسال أفضل {len(top_20)}")
     
-    if top_20:
-        print("أعلى الأسهم حالياً:")
-        for s in top_20[:5]:
-            print(f"   → {s['symbol']}: {s['change_pct']:+.2f}% | ${s['price']:.2f}")
+    candidates = filtered_list[:MAX_CANDIDATES]   # أعلى 45
+    top_25 = candidates[:MAX_SHOWN]               # نرسل أفضل 25 فقط
 
-    return top_20
+    print(f"🎯 أعلى {len(candidates)} مرشح (حجم ≥ {MIN_VOLUME}) | سيتم متابعة أفضل {len(top_25)}")
+    
+    if top_25:
+        print("أعلى الأسهم حالياً:")
+        for s in top_25[:5]:
+            print(f"   → {s['symbol']}: {s['change_pct']:+.2f}% | ${s['price']:.2f} | Vol: {s['volume']:,}")
+
+    return top_25
 
 # ================================
 # الدالة التنفيذية لدورة الفحص الواحدة
@@ -265,7 +272,7 @@ def run_scan_cycle():
 
     stocks = fetch_all_market_stocks()
     if not stocks:
-        print("⚠️ لم يتم العثور على أسهم تطابق شروط الصعود في هذه الجولة.")
+        print("⚠️ لم يتم العثور على أسهم تطابق الشروط في هذه الجولة.")
         return
 
     seen_stocks = load_seen()
@@ -274,14 +281,17 @@ def run_scan_cycle():
     for stock in stocks:
         symbol = stock["symbol"]
         current_price = stock["price"]
+        current_change = stock["change_pct"]
         volume_val = stock["volume"]
         
-        # عدم التكرار إلا إذا ارتفع السعر أكثر من آخر تنبيه
+        # --- منطق عدم التكرار ---
+        # لا نكرر الرسالة إلا إذا ارتفع التغير بنسبة +1.5% عن الرسالة الأولى
         if symbol in seen_stocks:
-            last_alerted_price = seen_stocks[symbol].get("last_price", 0.0)
-            if current_price <= last_alerted_price:
-                continue
+            first_change = seen_stocks[symbol].get("first_change_pct", 0.0)
+            if current_change < (first_change + REALERT_THRESHOLD):
+                continue   # لم يصل للحد المطلوب → نتخطى
 
+        # --- جلب إفصاحات SEC ---
         sec_summary, _, latest_acc = fetch_sec_filings_only(symbol)
         tv_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
@@ -291,18 +301,29 @@ def run_scan_cycle():
             f"🚨 <b>تنبيه سهم صاعد / تحديث ارتفاع</b> ({session_name})\n\n"
             f"🔹 الرمز: <b>{symbol}</b>\n"
             f"💵 السعر الحالي: <b>${current_price:.2f}</b>\n"
-            f"📈 التغير: <b>{stock['change_pct']:+.2f}%</b>\n"
+            f"📈 التغير: <b>{current_change:+.2f}%</b>\n"
             f"📊 الحجم: <b>{vol_str}</b>\n\n"
             f"📄 <b>أحدث إفصاحات SEC:</b>\n{sec_summary}\n\n"
             f"📈 <a href='{tv_url}'>فتح الشارت على TradingView</a>"
         )
 
         if send_telegram_message(message):
-            seen_stocks[symbol] = {
-                "time": datetime.now(RIYADH).strftime("%H:%M:%S"),
-                "last_price": current_price,
-                "latest_acc": latest_acc
-            }
+            # نحفظ بيانات الرسالة الأولى (أو نحدثها)
+            if symbol not in seen_stocks:
+                # أول مرة → نحفظ نسبة التغير الأصلية
+                seen_stocks[symbol] = {
+                    "time": datetime.now(RIYADH).strftime("%H:%M:%S"),
+                    "first_change_pct": current_change,
+                    "last_price": current_price,
+                    "latest_acc": latest_acc
+                }
+            else:
+                # تحديث فقط (وصل لـ +1.5)
+                seen_stocks[symbol]["time"] = datetime.now(RIYADH).strftime("%H:%M:%S")
+                seen_stocks[symbol]["last_price"] = current_price
+                seen_stocks[symbol]["latest_acc"] = latest_acc
+                # نترك first_change_pct كما هو (من الرسالة الأولى)
+
             new_stocks_found += 1
             time.sleep(1)
 
@@ -330,7 +351,9 @@ def seconds_until_next_premarket():
 # التشغيل المستمر (Loop)
 # ================================
 def main():
-    print("🚀 بدء تشغيل بوت مراقبة الأسهم (Top 50 + Finnhub Fallback + أفضل 20 سهم)")
+    print("🚀 بدء تشغيل بوت مراقبة الأسهم")
+    print(f"📌 الشروط: حجم ≥ {MIN_VOLUME} | أعلى {MAX_CANDIDATES} مرشح → أفضل {MAX_SHOWN}")
+    print(f"📌 إعادة التنبيه فقط عند ارتفاع +{REALERT_THRESHOLD}% عن الرسالة الأولى")
     
     while True:
         try:
