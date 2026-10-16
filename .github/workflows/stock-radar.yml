@@ -1,47 +1,85 @@
+
+
 name: Stock Radar Bot
 
 on:
+
   # كل 5 دقائق خلال أوقات التداول (UTC)
+
   schedule:
+
     - cron: '*/5 8-23 * * 1-5'
-  
+
   # تشغيل يدوي
+
   workflow_dispatch:
 
 jobs:
+
   run-bot:
+
     runs-on: ubuntu-latest
 
+    permissions:
+
+      contents: write
+
     steps:
+
     - name: Checkout repository
+
       uses: actions/checkout@v4
 
     - name: Set up Python
+
       uses: actions/setup-python@v5
+
       with:
+
         python-version: '3.11'
 
     - name: Install dependencies
+
       run: |
+
         python -m pip install --upgrade pip
+
         pip install requests
 
     - name: Run Stock Radar Bot
+
       env:
+
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+
         CHAT_ID: ${{ secrets.CHAT_ID }}
-        ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-        ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+
       run: |
+
         python main.py
 
     - name: Commit and push changes if seen_stocks.json changed
+
       run: |
+
         if [ -f "seen_stocks.json" ]; then
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
+
+          git config user.name "GitHub Actions Bot"
+
+          git config user.email "actions@github.com"
+
           git add seen_stocks.json
-          git diff --quiet && git diff --cached --quiet || (git commit -m "Update seen stocks record [skip ci]" && git push)
+
+          git diff --cached --quiet || (
+
+            git commit -m "Update seen stocks record [skip ci]" &&
+
+            git push
+
+          )
+
         else
+
           echo "seen_stocks.json does not exist yet, skipping commit."
+
         fi
