@@ -30,8 +30,7 @@ jobs:
       env:
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         CHAT_ID: ${{ secrets.CHAT_ID }}
-        TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-        FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-        FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+        ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       run: |
         python main.py
