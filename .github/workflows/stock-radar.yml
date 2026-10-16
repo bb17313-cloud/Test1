@@ -1,7 +1,7 @@
 name: Stock Radar Bot
 
 on:
-  # كل 5 دقائق خلال أوقات التداول (بتوقيت UTC تقريباً يغطي Pre + Main + Post)
+  # كل 5 دقائق خلال أوقات التداول (UTC)
   schedule:
     - cron: '*/5 8-23 * * 1-5'
   
@@ -32,6 +32,6 @@ jobs:
         CHAT_ID: ${{ secrets.CHAT_ID }}
         TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
         FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-        FMP_API_KEY: ${{ secrets.FMP_API_KEY }}          # ← أضفت هذا
+        FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
       run: |
         python main.py
