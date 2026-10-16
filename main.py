@@ -19,7 +19,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
 MAX_CANDIDATES = 45
 MAX_SHOWN = 25
-MIN_VOLUME = 5000
+MIN_VOLUME = 1000          # خففنا الحجم
 REALERT_THRESHOLD = 1.5
 
 # ================================
@@ -196,13 +196,18 @@ def fetch_all_market_stocks():
             gainers = data.get("gainers", [])
             print(f"📦 [Alpaca] عدد الأسهم الراجعة: {len(gainers)}")
 
+            # طباعة مثال عشان نعرف شكل البيانات
+            if gainers:
+                print("مثال أول سهم:", gainers[0])
+
             for item in gainers:
                 symbol = item.get("symbol")
                 price = float(item.get("price", 0) or 0)
                 change_pct = float(item.get("percent_change", 0) or 0)
                 volume = int(item.get("volume", 0) or 0)
 
-                if symbol and price > 0 and volume >= MIN_VOLUME and change_pct >= 3.0:
+                # فلتر مخفف
+                if symbol and price > 0 and change_pct >= 1.5:
                     all_stocks_dict[symbol] = {
                         "symbol": symbol,
                         "price": price,
