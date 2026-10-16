@@ -19,7 +19,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 SEEN_FILE = "seen_stocks.json"
 MAX_CANDIDATES = 45
 MAX_SHOWN = 25
-REALERT_THRESHOLD = 1.5
+REALERT_THRESHOLD = 1.5  # شرط التكرار وإعادة التنبيه
 
 # الأسواق المسموحة فقط
 ALLOWED_EXCHANGES = {"NASDAQ", "NYSE", "AMEX"}
