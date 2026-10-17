@@ -21,7 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests pypdf python-docx
+        run: pip install requests pypdf python-docx yt-dlp
 
       - name: Run bot
         env:
