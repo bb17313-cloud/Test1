@@ -39,6 +39,7 @@ MAX_SUMMARY_CHARS = 400000
 TRANSLATE_LIMIT = 60000        # أقصى عدد أحرف للترجمة الكاملة
 CHUNK = 9000                   # حجم جزء الترجمة
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024   # حد تنزيل البوتات في تيليغرام
+TG_UPLOAD_MB = 50              # حد رفع البوتات في تيليغرام
 MAX_DOWNLOAD_MB = 300          # أقصى حجم لروابط الملفات المباشرة
 SEG_SECONDS = 600              # تقسيم الصوت إلى أجزاء من 10 دقائق
 MAX_SEGMENTS = 18              # حتى 3 ساعات
@@ -56,6 +57,7 @@ HELP = (
     "🎙 أرسل رسالة صوتية أو ملف صوت ← أفرّغه وأترجمه.\n"
     "🎬 أرسل فيديو قصير ← أفرّغ كلامه وأترجمه.\n"
     "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...)، أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
+    "⬇️ أضف كلمة «تحميل» مع رابط (X / تيك توك / إنستغرام / فيسبوك...) ← أحمّل الفيديو وأرسله لك.\n"
     "💬 بعد أي تلخيص أو تفريغ تظهر أزرار لسؤالي عن أي نقطة في المستند.\n\n"
     "الأوامر:\n"
     "/start - المساعدة\n"
@@ -122,6 +124,25 @@ def send_document(chat_id, filename, content, caption="", reply_to=None):
                       files={"document": (filename, content.encode("utf-8"))}, timeout=120)
     except Exception as e:
         print("sendDocument error:", e)
+
+
+def send_video(chat_id, path, caption="", reply_to=None):
+    """إرسال فيديو (حتى 50 ميجا). إن رفضه تيليغرام كفيديو يُرسل كملف."""
+    for method, field in (("sendVideo", "video"), ("sendDocument", "document")):
+        data = {"chat_id": chat_id, "caption": caption[:1000]}
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+        if method == "sendVideo":
+            data["supports_streaming"] = "true"
+        try:
+            with open(path, "rb") as f:
+                r = requests.post(f"{API}/{method}", data=data,
+                                  files={field: (os.path.basename(path), f)}, timeout=600)
+            if r.json().get("ok"):
+                return True
+        except Exception as e:
+            print(f"{method} error:", e)
+    return False
 
 
 def download(file_id):
@@ -268,6 +289,40 @@ def download_with_ytdlp(url):
             raise Exception(f"الملف أكبر من {MAX_DOWNLOAD_MB} ميجا")
         with open(path, "rb") as f:
             return f.read(), os.path.basename(path)
+
+
+def download_video_ytdlp(url, out_dir):
+    """تحميل الفيديو (mp4) بأقصى حجم يقبله تيليغرام. يرجع مسار الملف."""
+    lim = TG_UPLOAD_MB - 2
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--socket-timeout", "30", "--no-warnings",
+           "-f", f"b[ext=mp4][filesize<{lim}M]/b[filesize<{lim}M]/bv*[ext=mp4]+ba[ext=m4a]/b",
+           "--merge-output-format", "mp4", "--max-filesize", f"{TG_UPLOAD_MB}M",
+           "-o", os.path.join(out_dir, "video.%(ext)s"), url]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    files = glob.glob(os.path.join(out_dir, "video.*"))
+    if r.returncode != 0 or not files:
+        lines = [l for l in (r.stderr or "").strip().splitlines() if l.strip()]
+        reason = lines[-1][:200] if lines else "سبب غير معروف"
+        if "larger than max-filesize" in (r.stderr or "").lower():
+            raise Exception(f"الفيديو أكبر من {TG_UPLOAD_MB} ميجا (حد تيليغرام للبوتات).")
+        raise Exception(f"تعذر تحميل الفيديو من الرابط: {reason}")
+    path = files[0]
+    if os.path.getsize(path) > TG_UPLOAD_MB * 1024 * 1024:
+        raise Exception(f"الفيديو أكبر من {TG_UPLOAD_MB} ميجا (حد تيليغرام للبوتات).")
+    return path
+
+
+def process_video_download(chat_id, mid, url):
+    sid = status_start(chat_id, "⏳ جاري تحميل الفيديو...", mid)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = download_video_ytdlp(url, d)
+            status_update(chat_id, sid, "📤 جاري إرسال الفيديو...")
+            ok = send_video(chat_id, path, "✅ تم التحميل\n(أرسل الرابط بدون كلمة «تحميل» لتفريغ كلامه وترجمته)", mid)
+        if not ok:
+            send(chat_id, "⚠️ تم التحميل لكن تعذر رفع الفيديو إلى تيليغرام.", mid)
+    finally:
+        status_end(chat_id, sid)
 
 
 # ---------- Gemini ----------
@@ -619,7 +674,10 @@ def handle(msg):
                     send(chat_id, summarize(body), mid, markup=keyboard())
             elif URL_RE.search(text):
                 url = URL_RE.search(text).group(0)
-                if YT_RE.search(url):
+                want_download = "تحميل" in text or "download" in text.lower()
+                if want_download and (is_video_site(url) or YT_RE.search(url)):
+                    process_video_download(chat_id, mid, url)
+                elif YT_RE.search(url):
                     process_youtube(chat_id, mid, url)
                 elif is_video_site(url):
                     sid = status_start(chat_id, "⏳ جاري تحميل الصوت من الرابط...", mid)
