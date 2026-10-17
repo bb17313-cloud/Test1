@@ -14,7 +14,7 @@ CHAT_ID = str(os.environ["CHAT_ID"])
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))  # مدة بقاء البوت في كل تشغيل
 
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
