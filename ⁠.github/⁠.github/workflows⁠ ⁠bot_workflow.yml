@@ -1,17 +1,19 @@
-name: Telegram Bot Check Workflow
+name: Telegram Gemini Bot Workflow
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch: # يتيح لك تشغيل الـ Workflow يدوياً من GitHub
 
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -23,6 +25,5 @@ jobs:
         python -m pip install --upgrade pip
         pip install python-telegram-bot google-generativeai PyPDF2 python-docx
 
-    - name: Verify Code Syntax
-      run: |
-        python -m py_compile bot_gemini.py
+    - name: Run Telegram Bot
+      run: python bot_gemini.py
