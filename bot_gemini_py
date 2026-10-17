@@ -1,0 +1,115 @@
+import os
+import asyncio
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+import google.generativeai as genai
+from PyPDF2 import PdfReader
+from docx import Document
+
+# ==========================================
+# 1. إعداد المفاتيح الخاصة بك
+# ==========================================
+TELEGRAM_BOT_TOKEN = "ضع_توكن_تلغرام_هنا"
+GEMINI_API_KEY = "ضع_مفتاح_gemini_api_هنا"
+
+# تهيئة مكتبة Google Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+# ==========================================
+# 2. دوال قراءة النصوص من الملفات
+# ==========================================
+def read_pdf(file_path):
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def read_docx(file_path):
+    doc = Document(file_path)
+    text = "\n".join([para.text for para in doc.paragraphs])
+    return text
+
+# ==========================================
+# 3. دالة معالجة واستقبال المستندات
+# ==========================================
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = await update.message.document.get_file()
+    file_name = update.message.document.file_name
+    
+    local_path = f"./{file_name}"
+    await file.download_to_drive(local_path)
+    
+    msg = await update.message.reply_text("⏳ جاري قراءة المستند وتلخيصه وترجمته بواسطة Google Gemini...")
+    
+    text = ""
+    try:
+        # فحص نوع الملف وقراءته
+        if file_name.lower().endswith('.pdf'):
+            text = read_pdf(local_path)
+        elif file_name.lower().endswith('.docx'):
+            text = read_docx(local_path)
+        elif file_name.lower().endswith('.txt'):
+            with open(local_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
+        else:
+            await msg.edit_text("❌ صيغة غير مدعومة. يرجى إرسال ملف PDF أو Word (.docx) أو TXT.")
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            return
+
+        if not text.strip():
+            await msg.edit_text("⚠️ لم يتم العثور على نص قابل للقراءة (قد يكون المستند عبارة عن صور مسحوبة ضوئياً).")
+            if os.remove(local_path):
+                os.remove(local_path)
+            return
+
+        # إعداد الطلب الموجه لـ Gemini
+        prompt = f"""
+        أنت مساعد ذكي ومتخصص في تحليل المستندات وترجمتها.
+        المطلوب منك:
+        1. قراءة النص أدناه بتمعن.
+        2. استخراج النقاط والأفكار الرئيسية بشكل منظم ومختصر.
+        3. كتابة النتيجة والترجمة باللغة العربية بأسلوب سليم وواضح.
+
+        النص:
+        ---
+        {text[:30000]}
+        ---
+        """
+
+        # إرسال الطلب إلى Gemini
+        response = await asyncio.to_thread(model.generate_content, prompt)
+        summary = response.text
+
+        # تقسيم الرسالة إذا كانت أطول من حد تلغرام (4000 حرف)
+        if len(summary) > 4000:
+            await msg.edit_text("📄 **ملخص وترجمة المستند (Gemini):**")
+            for i in range(0, len(summary), 4000):
+                await update.message.reply_text(summary[i:i+4000])
+        else:
+            await msg.edit_text(f"📄 **ملخص وترجمة المستند (Gemini):**\n\n{summary}")
+
+    except Exception as e:
+        await msg.edit_text(f"❌ حدث خطأ أثناء المعالجة: {str(e)}")
+    
+    finally:
+        # تنظيف الملف المؤقت
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+# ==========================================
+# 4. تشغيل البوت
+# ==========================================
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # فلتر لاستقبال المستندات (PDF, Word, TXT)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    print("🤖 البوت يعمل الآن محلياً بنجاح باستخدام Google Gemini...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
