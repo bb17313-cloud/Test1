@@ -1,4 +1,0 @@
-python-telegram-bot
-google-generativeai
-PyPDF2
-python-docx
