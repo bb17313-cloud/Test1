@@ -2,7 +2,7 @@ name: translator-summary-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # كل 5 دقائق
+    - cron: "*/30 * * * *"  # تشغيل جديد ينتظر في الطابور ويبدأ فور انتهاء السابق
   workflow_dispatch:
 
 concurrency:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -28,5 +28,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          RUN_SECONDS: "270"
+          RUN_SECONDS: "20400"
+          SEC_USER_AGENT: "MyBot your_email@example.com"
         run: python bot.py
