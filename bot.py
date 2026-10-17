@@ -22,6 +22,8 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODELS = [m.strip() for m in os.environ.get(
+    "GEMINI_FALLBACK_MODELS", "gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20400"))  # مدة بقاء البوت في كل تشغيل
 
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
@@ -269,27 +271,71 @@ def download_with_ytdlp(url):
 
 
 # ---------- Gemini ----------
+class QuotaError(Exception):
+    """تجاوز حد الاستخدام في Gemini (للنموذج الأساسي والاحتياطي)."""
+
+
+QUOTA_MSG = (
+    "⚠️ تم استهلاك حد استخدام Gemini المجاني مؤقتاً (جرّبت النموذج الاحتياطي الأخف أيضاً).\n\n"
+    "• الحد اليومي يتجدد تلقائياً، فأعد المحاولة بعد قليل أو غداً.\n"
+    "• حدّ الدقيقة يتجدد خلال دقائق.\n"
+    "• للحل الدائم: فعّل الدفع حسب الاستخدام من Google AI Studio (تكلفة بوت شخصي صغيرة عادة).\n"
+    "• يمكنك تخفيف الاستهلاك بإرسال مستندات أقصر."
+)
+
+
+def friendly_error(e):
+    """تحويل الأخطاء إلى رسائل عربية واضحة."""
+    if isinstance(e, QuotaError):
+        return QUOTA_MSG
+    msg = str(e)
+    low = msg.lower()
+    if "api key" in low and ("invalid" in low or "not valid" in low):
+        return "❌ مفتاح GEMINI_API_KEY غير صالح. تأكد من السر في إعدادات GitHub."
+    if "not found" in low and "model" in low:
+        return "❌ اسم النموذج غير صحيح أو غير متاح. غيّر المتغير GEMINI_MODEL في bot.yml."
+    return f"❌ حدث خطأ: {msg[:300]}"
+
+
 def gemini(system, parts, max_tokens=2000, timeout=300):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"maxOutputTokens": max_tokens},
     }
     headers = {"x-goog-api-key": GEMINI_API_KEY}
-    data, r = {}, None
-    for attempt in range(4):
-        r = requests.post(url, json=body, headers=headers, timeout=timeout)
-        try:
-            data = r.json()
-        except Exception:
-            data = {}
-        if r.status_code in (429, 500, 503) and attempt < 3:
-            time.sleep(15 * (attempt + 1))  # انتظار ثم إعادة المحاولة
-            continue
-        break
-    if r.status_code != 200:
-        raise Exception(data.get("error", {}).get("message", "Gemini error"))
+    models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    last_status, last_msg, data = None, "Gemini error", {}
+    for idx, model in enumerate(models):
+        is_last = idx == len(models) - 1
+        attempts = 3 if is_last else 1   # النماذج غير الأخيرة: ننتقل فوراً للنموذج التالي
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(attempts):
+            r = requests.post(url, json=body, headers=headers, timeout=timeout)
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if r.status_code == 200:
+                if idx > 0:
+                    print(f"استُخدم النموذج الاحتياطي: {model}")
+                return _parse_gemini(data)
+            last_status = r.status_code
+            last_msg = data.get("error", {}).get("message", "Gemini error")
+            if r.status_code in (429, 500, 503):
+                if attempt < attempts - 1:
+                    time.sleep(15 * (attempt + 1))
+                    continue
+                break  # الانتقال للنموذج التالي
+            if r.status_code == 404 and idx > 0:
+                break  # النموذج الاحتياطي غير موجود، جرّب التالي
+            raise Exception(last_msg)
+    if last_status == 429:
+        raise QuotaError(last_msg)
+    raise Exception(last_msg)
+
+
+def _parse_gemini(data):
     cands = data.get("candidates") or []
     if not cands:
         raise Exception("لم يُرجع النموذج أي نتيجة (قد يكون المحتوى محجوباً).")
@@ -627,7 +673,7 @@ def handle(msg):
 
     except Exception as e:
         print(traceback.format_exc())
-        send(chat_id, f"❌ حدث خطأ: {str(e)[:300]}", mid)
+        send(chat_id, friendly_error(e), mid)
 
 
 def translate_limited(content):
@@ -657,7 +703,7 @@ def handle_callback(cb):
             send(chat_id, key_facts())
     except Exception as e:
         print(traceback.format_exc())
-        send(chat_id, f"❌ حدث خطأ: {str(e)[:300]}")
+        send(chat_id, friendly_error(e))
 
 
 # ---------- التشغيل ----------
