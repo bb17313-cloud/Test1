@@ -7,10 +7,10 @@ from PyPDF2 import PdfReader
 from docx import Document
 
 # ==========================================
-# 1. إعداد المفاتيح الخاصة بك
+# 1. إعداد المفاتيح الخاصة بك (تمت الإضافة)
 # ==========================================
-TELEGRAM_BOT_TOKEN = "ضع_توكن_تلغرام_هنا"
-GEMINI_API_KEY = "ضع_مفتاح_gemini_api_هنا"
+TELEGRAM_BOT_TOKEN = "8771766777:AAHuw7trKt9ExiV0rUgt5osi5x28LLlCi7k"
+GEMINI_API_KEY = "AQ.Ab8RN6LeN6LVAuRMv_Jo4WFdnr9..."     # مفتاح Gemini الخاص بك
 
 # تهيئة مكتبة Google Gemini
 genai.configure(api_key=GEMINI_API_KEY)
@@ -61,7 +61,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not text.strip():
             await msg.edit_text("⚠️ لم يتم العثور على نص قابل للقراءة (قد يكون المستند عبارة عن صور مسحوبة ضوئياً).")
-            if os.remove(local_path):
+            if os.path.exists(local_path):
                 os.remove(local_path)
             return
 
@@ -70,8 +70,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         أنت مساعد ذكي ومتخصص في تحليل المستندات وترجمتها.
         المطلوب منك:
         1. قراءة النص أدناه بتمعن.
-        2. استخراج النقاط والأفكار الرئيسية بشكل منظم ومختصر.
-        3. كتابة النتيجة والترجمة باللغة العربية بأسلوب سليم وواضح.
+        2. استخرج النقاط والأفكار الرئيسية بشكل منظم ومختصر.
+        3. اكتب النتيجة والترجمة باللغة العربية بأسلوب سليم وواضح.
 
         النص:
         ---
