@@ -3,7 +3,6 @@ import os
 import time
 
 import requests
-import anthropic
 from pypdf import PdfReader
 from docx import Document
 
@@ -11,10 +10,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = str(os.environ["CHAT_ID"])
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))  # مدة بقاء البوت في كل تشغيل
-
-client = anthropic.Anthropic()  # يقرأ ANTHROPIC_API_KEY تلقائياً
 
 MAX_FILE_MB = 15
 MAX_SUMMARY_CHARS = 60000
@@ -65,15 +63,20 @@ def extract_text(name, data):
     return None
 
 
-# ---------- Claude ----------
+# ---------- Gemini ----------
 def ask(system, text, max_tokens=2000):
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": text}],
-    )
-    return "".join(b.text for b in msg.content if b.type == "text").strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+    body = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    }
+    r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=120)
+    data = r.json()
+    if r.status_code != 200:
+        raise Exception(data.get("error", {}).get("message", "Gemini error"))
+    parts = data["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 def translate(text):
