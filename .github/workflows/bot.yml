@@ -29,5 +29,5 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RUN_SECONDS: "20400"
-          SEC_USER_AGENT: "MyBot your_email@example.com"
+          SEC_USER_AGENT: "MyBot Stockxxx90@gmail.com"
         run: python bot.py
