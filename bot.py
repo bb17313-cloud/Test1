@@ -1,6 +1,9 @@
 import io
 import os
+import re
 import time
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 
 import requests
 from pypdf import PdfReader
@@ -14,6 +17,9 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))  # مدة بقاء البوت في كل تشغيل
 
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
+URL_RE = re.compile(r"https?://\S+")
+
 MAX_FILE_MB = 15
 MAX_SUMMARY_CHARS = 60000
 CHUNK = 3500
@@ -22,7 +28,8 @@ HELP = (
     "👋 أهلاً بك!\n\n"
     "📝 أرسل لي أي نص بأي لغة وسأترجمه إلى العربية.\n"
     "📄 أرسل لي ملف (PDF / Word / TXT) وسألخصه لك بالعربية.\n"
-    "🌐 أرسل الملف مع كلمة «ترجمة» في التعليق وسأترجمه بدل التلخيص.\n\n"
+    "🌐 أرسل الملف مع كلمة «ترجمة» في التعليق وسأترجمه بدل التلخيص.\n"
+    "🔗 أرسل رابطاً (مثل ملفات SEC) وسأفتحه وألخصه لك. أضف كلمة «ترجمة» مع الرابط لترجمته.\n\n"
     "الأوامر:\n"
     "/start - المساعدة\n"
     "/sum نص طويل - تلخيص نص"
@@ -63,6 +70,64 @@ def extract_text(name, data):
     return None
 
 
+# ---------- فتح الروابط ----------
+class _TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.out = []
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        elif tag in ("br", "p", "div", "tr", "li", "h1", "h2", "h3", "table"):
+            self.out.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self.skip:
+            self.skip -= 1
+        elif tag in ("td", "th"):
+            self.out.append(" | ")
+
+    def handle_data(self, data):
+        if not self.skip and data.strip():
+            self.out.append(data.strip() + " ")
+
+
+def html_to_text(raw):
+    p = _TextExtractor()
+    p.feed(raw)
+    text = "".join(p.out)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
+
+
+def xml_to_text(raw):
+    root = ET.fromstring(raw.encode("utf-8"))
+    lines = []
+    for el in root.iter():
+        tag = el.tag.split("}")[-1]
+        val = (el.text or "").strip()
+        if val:
+            lines.append(f"{tag}: {val}")
+    return "\n".join(lines)
+
+
+def fetch_url(url):
+    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
+    r = requests.get(url, headers=headers, timeout=60)
+    r.raise_for_status()
+    ctype = r.headers.get("Content-Type", "").lower()
+    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+        return extract_text("x.pdf", r.content) or ""
+    raw = r.text
+    if raw.lstrip().startswith("<?xml") and "html" not in ctype:
+        try:
+            return xml_to_text(raw)
+        except Exception:
+            pass
+    return html_to_text(raw)
+
+
 # ---------- Gemini ----------
 def ask(system, text, max_tokens=2000):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
@@ -89,15 +154,26 @@ def translate(text):
     return "\n".join(ask(system, p, 3000) for p in parts)
 
 
-def summarize(text):
-    system = (
-        "أنت مساعد متخصص في تلخيص المستندات. لخّص المستند التالي بالعربية "
-        "بهذا الشكل:\n"
-        "📌 الموضوع: (سطر واحد)\n"
-        "📋 أهم النقاط: (نقاط واضحة ومختصرة)\n"
-        "✅ الخلاصة: (جملتان)\n"
-        "لا تضف معلومات غير موجودة في المستند."
-    )
+def summarize(text, sec=False):
+    if sec:
+        system = (
+            "أنت محلل أسهم أمريكية. لخّص إفصاح SEC التالي بالعربية بهذا الشكل:\n"
+            "📄 نوع النموذج: (مثل 13G / 8-K / 10-Q / Form 4)\n"
+            "🏢 الشركة: (الاسم والرمز إن وجد)\n"
+            "👤 مقدم الإفصاح: (الجهة أو الشخص)\n"
+            "📌 أهم ما ورد: (نقاط واضحة: عدد الأسهم، النسبة، المبالغ، التواريخ، القرار أو الحدث)\n"
+            "💡 المعنى للمتداول: (جملتان بدون توصية شراء أو بيع)\n"
+            "استخدم فقط المعلومات الموجودة في المستند ولا تخمّن."
+        )
+    else:
+        system = (
+            "أنت مساعد متخصص في تلخيص المستندات. لخّص المستند التالي بالعربية "
+            "بهذا الشكل:\n"
+            "📌 الموضوع: (سطر واحد)\n"
+            "📋 أهم النقاط: (نقاط واضحة ومختصرة)\n"
+            "✅ الخلاصة: (جملتان)\n"
+            "لا تضف معلومات غير موجودة في المستند."
+        )
     return ask(system, text[:MAX_SUMMARY_CHARS], 1500)
 
 
@@ -120,6 +196,16 @@ def handle(msg):
                     send(chat_id, "اكتب النص بعد الأمر: /sum النص هنا", mid)
                 else:
                     send(chat_id, summarize(body), mid)
+            elif URL_RE.search(text):
+                url = URL_RE.search(text).group(0)
+                send(chat_id, "⏳ جاري فتح الرابط...", mid)
+                content = fetch_url(url)
+                if not content.strip():
+                    send(chat_id, "⚠️ لم أجد نصاً في الرابط.", mid)
+                elif "ترجمة" in text or "translate" in text.lower():
+                    send(chat_id, translate(content[:20000]), mid)
+                else:
+                    send(chat_id, summarize(content, sec="sec.gov" in url), mid)
             else:
                 send(chat_id, translate(text), mid)
 
