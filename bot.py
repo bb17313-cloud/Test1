@@ -4,6 +4,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -26,6 +27,8 @@ RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20400"))  # مدة بقاء ا�
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
 URL_RE = re.compile(r"https?://\S+")
 YT_RE = re.compile(r"(youtube\.com/(watch|shorts|live)|youtu\.be/)", re.I)
+VIDEO_SITES = ("twitter.com", "x.com", "tiktok.com", "facebook.com", "fb.watch", "instagram.com",
+               "vimeo.com", "dailymotion.com", "twitch.tv", "reddit.com", "streamable.com", "soundcloud.com")
 MEDIA_EXTS = (".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".flac", ".aac",
               ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp")
 
@@ -50,7 +53,7 @@ HELP = (
     "🔗 أرسل رابطاً (مثل ملفات SEC) ← أفتحه وألخصه (أضف «ترجمة» لترجمته).\n"
     "🎙 أرسل رسالة صوتية أو ملف صوت ← أفرّغه وأترجمه.\n"
     "🎬 أرسل فيديو قصير ← أفرّغ كلامه وأترجمه.\n"
-    "▶️ أرسل رابط يوتيوب أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
+    "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...)، أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
     "💬 بعد أي تلخيص أو تفريغ تظهر أزرار لسؤالي عن أي نقطة في المستند.\n\n"
     "الأوامر:\n"
     "/start - المساعدة\n"
@@ -238,6 +241,31 @@ def download_media_url(url):
             if buf.tell() > limit:
                 raise Exception(f"الملف أكبر من {MAX_DOWNLOAD_MB} ميجا")
         return buf.getvalue()
+
+
+def is_video_site(url):
+    host = urlparse(url).netloc.lower().split(":")[0]
+    return any(host == d or host.endswith("." + d) for d in VIDEO_SITES)
+
+
+def download_with_ytdlp(url):
+    """تحميل الصوت من مواقع الفيديو بأداة yt-dlp. يرجع (bytes, اسم الملف)."""
+    limit = MAX_DOWNLOAD_MB * 1024 * 1024
+    with tempfile.TemporaryDirectory() as d:
+        cmd = [sys.executable, "-m", "yt_dlp", "-f", "bestaudio/best", "--no-playlist",
+               "--max-filesize", f"{MAX_DOWNLOAD_MB}M", "--socket-timeout", "30",
+               "--no-warnings", "-o", os.path.join(d, "media.%(ext)s"), url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        files = glob.glob(os.path.join(d, "media.*"))
+        if r.returncode != 0 or not files:
+            lines = [l for l in (r.stderr or "").strip().splitlines() if l.strip()]
+            reason = lines[-1][:200] if lines else "سبب غير معروف"
+            raise Exception(f"تعذر تحميل الصوت من الرابط: {reason}")
+        path = files[0]
+        if os.path.getsize(path) > limit:
+            raise Exception(f"الملف أكبر من {MAX_DOWNLOAD_MB} ميجا")
+        with open(path, "rb") as f:
+            return f.read(), os.path.basename(path)
 
 
 # ---------- Gemini ----------
@@ -547,6 +575,11 @@ def handle(msg):
                 url = URL_RE.search(text).group(0)
                 if YT_RE.search(url):
                     process_youtube(chat_id, mid, url)
+                elif is_video_site(url):
+                    sid = status_start(chat_id, "⏳ جاري تحميل الصوت من الرابط...", mid)
+                    data, fname = download_with_ytdlp(url)
+                    status_end(chat_id, sid)
+                    process_media(chat_id, mid, data, fname, url)
                 elif is_media_url(url):
                     sid = status_start(chat_id, "⏳ جاري تحميل الملف من الرابط...", mid)
                     data = download_media_url(url)
