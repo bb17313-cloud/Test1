@@ -15,7 +15,7 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))  # مدة بقاء البوت في كل تشغيل
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20400"))  # مدة بقاء البوت في كل تشغيل
 
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
 URL_RE = re.compile(r"https?://\S+")
@@ -141,7 +141,7 @@ def ask(system, text, max_tokens=2000):
     if r.status_code != 200:
         raise Exception(data.get("error", {}).get("message", "Gemini error"))
     parts = data["candidates"][0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in parts).strip()
+    return "".join(p.get("text", "") for p in parts).replace("**", "").strip()
 
 
 def translate(text):
