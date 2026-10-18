@@ -28,6 +28,9 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          AI_PROVIDER: "groq"  # يمكنك جعله gemini أو groq حسب رغبتك في التشغيل
+          GROQ_MODEL: "llama-3.3-70b-versatile"
           RUN_SECONDS: "20400"
           SEC_USER_AGENT: "MyBot Stockxxx90@gmail.com"
         run: python bot.py
