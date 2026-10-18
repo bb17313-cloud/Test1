@@ -21,10 +21,17 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = str(os.environ["CHAT_ID"])
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+# إعدادات النماذج (Gemini و Groq)
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
     "GEMINI_FALLBACK_MODELS", "gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20400"))  # مدة بقاء البوت في كل تشغيل
 
 SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
@@ -55,10 +62,10 @@ HELP = (
     "📝 أرسل نصاً بأي لغة ← أترجمه إلى العربية.\n"
     "📄 أرسل ملف PDF / Word / TXT ← ألخصه بالعربية (أضف كلمة «ترجمة» في التعليق لترجمته).\n"
     "🔗 أرسل رابطاً (مثل ملفات SEC) ← أفتحه وألخصه (أضف «ترجمة» لترجمته).\n"
-    "🖼 أرسل صورة أو لقطة شاشة ← أستخرج نصها وأترجمه (أضف «تلخيص» في التعليق لتلخيصه).\n"
+    "🖼 أرسل صورة أو شارت (مثل TradingView) ← أقوم بتحليلها وقراءة البيانات الفنية منها.\n"
     "🎙 أرسل رسالة صوتية أو ملف صوت ← أفرّغه وأترجمه.\n"
     "🎬 أرسل فيديو قصير ← أفرّغ كلامه وأترجمه.\n"
-    "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...)، أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
+    "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...), أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
     "⬇️ أضف كلمة «تحميل» مع رابط (X / تيك توك / إنستغرام / فيسبوك...) ← أحمّل الفيديو وأرسله لك.\n"
     "📊 تحليل سهم أمريكي: أرسل «تحليل UPLD» أو رابط شارت TradingView.\n"
     "💬 بعد أي تلخيص أو تفريغ تظهر أزرار لسؤالي عن أي نقطة في المستند.\n\n"
@@ -130,7 +137,6 @@ def send_document(chat_id, filename, content, caption="", reply_to=None):
 
 
 def send_video(chat_id, path, caption="", reply_to=None):
-    """إرسال فيديو (حتى 50 ميجا). إن رفضه تيليغرام كفيديو يُرسل كملف."""
     for method, field in (("sendVideo", "video"), ("sendDocument", "document")):
         data = {"chat_id": chat_id, "caption": caption[:1000]}
         if reply_to:
@@ -253,7 +259,6 @@ def is_media_url(url):
 
 
 def download_media_url(url):
-    """تحميل ملف صوت/فيديو من رابط مباشر مع حد أقصى للحجم."""
     limit = MAX_DOWNLOAD_MB * 1024 * 1024
     headers = {"User-Agent": SEC_USER_AGENT}
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
@@ -275,7 +280,6 @@ def is_video_site(url):
 
 
 def download_with_ytdlp(url):
-    """تحميل الصوت من مواقع الفيديو بأداة yt-dlp. يرجع (bytes, اسم الملف)."""
     limit = MAX_DOWNLOAD_MB * 1024 * 1024
     with tempfile.TemporaryDirectory() as d:
         cmd = [sys.executable, "-m", "yt_dlp", "-f", "bestaudio/best", "--no-playlist",
@@ -295,7 +299,6 @@ def download_with_ytdlp(url):
 
 
 def download_video_ytdlp(url, out_dir):
-    """تحميل الفيديو (mp4) بأقصى حجم يقبله تيليغرام. يرجع مسار الملف."""
     lim = TG_UPLOAD_MB - 2
     cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--socket-timeout", "30", "--no-warnings",
            "-f", f"b[ext=mp4][filesize<{lim}M]/b[filesize<{lim}M]/bv*[ext=mp4]+ba[ext=m4a]/b",
@@ -328,34 +331,67 @@ def process_video_download(chat_id, mid, url):
         status_end(chat_id, sid)
 
 
-# ---------- Gemini ----------
+# ---------- محرك النماذج (Gemini / Groq) ----------
 class QuotaError(Exception):
-    """تجاوز حد الاستخدام في Gemini (للنموذج الأساسي والاحتياطي)."""
+    """تجاوز حد الاستخدام في النماذج."""
 
 
 QUOTA_MSG = (
-    "⚠️ تم استهلاك حد استخدام Gemini المجاني مؤقتاً (جرّبت النموذج الاحتياطي الأخف أيضاً).\n\n"
-    "• الحد اليومي يتجدد تلقائياً، فأعد المحاولة بعد قليل أو غداً.\n"
-    "• حدّ الدقيقة يتجدد خلال دقائق.\n"
-    "• للحل الدائم: فعّل الدفع حسب الاستخدام من Google AI Studio (تكلفة بوت شخصي صغيرة عادة).\n"
-    "• يمكنك تخفيف الاستهلاك بإرسال مستندات أقصر."
+    "⚠️ تم استهلاك حد الاستخدام المجاني للنموذج مؤقتاً.\n\n"
+    "• الحد اليومي يتجدد تلقائياً، فأعد المحاولة بعد قليل.\n"
+    "• يمكنك التحويل إلى النموذج الآخر عبر إعدادات البيئة."
 )
 
 
 def friendly_error(e):
-    """تحويل الأخطاء إلى رسائل عربية واضحة."""
     if isinstance(e, QuotaError):
         return QUOTA_MSG
     msg = str(e)
-    low = msg.lower()
-    if "api key" in low and ("invalid" in low or "not valid" in low):
-        return "❌ مفتاح GEMINI_API_KEY غير صالح. تأكد من السر في إعدادات GitHub."
-    if "not found" in low and "model" in low:
-        return "❌ اسم النموذج غير صحيح أو غير متاح. غيّر المتغير GEMINI_MODEL في bot.yml."
     return f"❌ حدث خطأ: {msg[:300]}"
 
 
-def gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
+def call_groq(system, parts, max_tokens=2000, timeout=300):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    messages = [{"role": "system", "content": system}]
+    user_content = []
+    
+    for p in parts:
+        if "text" in p:
+            user_content.append({"type": "text", "text": p["text"]})
+        elif "inline_data" in p:
+            mime = p["inline_data"]["mime_type"]
+            b64 = p["inline_data"]["data"]
+            user_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64}"
+                }
+            })
+            
+    if len(user_content) == 1 and user_content[0]["type"] == "text":
+        messages.append({"role": "user", "content": user_content[0]["text"]})
+    else:
+        messages.append({"role": "user", "content": user_content})
+
+    body = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens
+    }
+    
+    r = requests.post(url, json=body, headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        raise Exception(f"Groq API Error: {r.text}")
+    data = r.json()
+    return data["choices"][0]["message"]["content"].replace("**", "").strip()
+
+
+def call_gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
     body = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": parts}],
@@ -368,7 +404,7 @@ def gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
     last_status, last_msg, data = None, "Gemini error", {}
     for idx, model in enumerate(models):
         is_last = idx == len(models) - 1
-        attempts = 3 if is_last else 1   # النماذج غير الأخيرة: ننتقل فوراً للنموذج التالي
+        attempts = 3 if is_last else 1
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(attempts):
             r = requests.post(url, json=body, headers=headers, timeout=timeout)
@@ -377,8 +413,6 @@ def gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
             except Exception:
                 data = {}
             if r.status_code == 200:
-                if idx > 0:
-                    print(f"استُخدم النموذج الاحتياطي: {model}")
                 return _parse_gemini(data)
             last_status = r.status_code
             last_msg = data.get("error", {}).get("message", "Gemini error")
@@ -386,13 +420,22 @@ def gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
                 if attempt < attempts - 1:
                     time.sleep(15 * (attempt + 1))
                     continue
-                break  # الانتقال للنموذج التالي
+                break
             if r.status_code == 404 and idx > 0:
-                break  # النموذج الاحتياطي غير موجود، جرّب التالي
+                break
             raise Exception(last_msg)
     if last_status == 429:
         raise QuotaError(last_msg)
     raise Exception(last_msg)
+
+
+def gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
+    if AI_PROVIDER == "groq" and GROQ_API_KEY:
+        try:
+            return call_groq(system, parts, max_tokens, timeout)
+        except Exception as e:
+            print("Groq failed, falling back to Gemini:", e)
+    return call_gemini(system, parts, max_tokens, timeout, tools)
 
 
 def _parse_gemini(data):
@@ -420,7 +463,6 @@ def is_arabic(text, threshold=0.5):
 
 
 def chunk_text(text, size):
-    """تقسيم النص عند نهايات الفقرات حتى لا تنقطع الجمل."""
     parts, cur = [], ""
     for para in text.split("\n"):
         while len(para) > size:
@@ -533,7 +575,6 @@ def guess_mime(name, default):
 
 
 def split_audio(data, name):
-    """تحويل الصوت (أو صوت الفيديو) إلى mp3 مضغوط وتقسيمه إلى أجزاء. يرجع قائمة (bytes, mime)."""
     ext = os.path.splitext(name)[1] or ".bin"
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -617,7 +658,6 @@ def process_youtube(chat_id, mid, url):
 
 
 def get_media(msg):
-    """يرجع (file_id, name, size) إن كانت الرسالة صوتاً أو فيديو."""
     for key, default_name in (("voice", "voice.ogg"), ("audio", "audio.mp3"),
                               ("video", "video.mp4"), ("video_note", "note.mp4")):
         m = msg.get(key)
@@ -703,9 +743,7 @@ def short_err(e):
     return msg[:80]
 
 
-# ----- مصادر البيانات -----
 def fetch_tv(symbol, exchange=None):
-    """بيانات السهم من ماسح TradingView (سعر، حجم، فلوت، بيتا، دولة، موعد الأرباح...)."""
     def scan(columns):
         payload = {"filter": [{"left": "name", "operation": "equal", "right": symbol}],
                    "options": {"lang": "en"}, "markets": ["america"],
@@ -719,7 +757,7 @@ def fetch_tv(symbol, exchange=None):
     try:
         cols, rows = TV_COLUMNS_FULL, scan(TV_COLUMNS_FULL)
     except Exception:
-        cols, rows = TV_COLUMNS_CORE, scan(TV_COLUMNS_CORE)   # إن رفض عمود غير معروف
+        cols, rows = TV_COLUMNS_CORE, scan(TV_COLUMNS_CORE)
     if not rows:
         raise Exception("الرمز غير موجود في TradingView")
     pick = None
@@ -733,7 +771,6 @@ def fetch_tv(symbol, exchange=None):
 
 
 def fetch_yahoo(symbol, interval, range_, prepost=False):
-    """شموع OHLCV من Yahoo Finance. يرجع (bars, meta)."""
     sym = symbol.replace(".", "-")
     j = http_get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
                       params={"interval": interval, "range": range_,
@@ -763,7 +800,6 @@ def session_label(meta, t):
 
 
 def fetch_nasdaq_short(symbol):
-    """Short Interest من NASDAQ (يصدر مرتين شهرياً). يرجع قائمة الفترات الأحدث أولاً."""
     j = http_get_json(f"https://api.nasdaq.com/api/quote/{symbol}/short-interest",
                       params={"assetClass": "stocks"},
                       headers={"Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"},
@@ -776,7 +812,6 @@ def fetch_nasdaq_short(symbol):
     return [o for o in out if o["si"] is not None]
 
 
-# ----- المؤشرات الفنية (حسابات بالكود) -----
 def calc_atr(bars, n=14):
     trs = []
     for i in range(1, len(bars)):
@@ -825,7 +860,6 @@ def volume_profile(bars, bins=24):
 
 
 def compute_levels(bars, price):
-    """دعوم ومقاومات وأهداف ووقف خسارة من القمم والقيعان ومناطق الحجم وATR."""
     a = calc_atr(bars) or price * 0.03
     recent = bars[-120:]
     tol = max(0.5 * a, price * 0.01)
@@ -855,7 +889,7 @@ def compute_levels(bars, price):
     stop2 = min(strong, s1) - 0.5 * a
     if stop2 >= stop1:
         stop2 = stop1 - 0.5 * a
-    stop3 = max(min(b["l"] for b in bars[-20:]) - 0.25 * a, stop2 - 2.0 * a)  # الوقف الدموي لا يبعد أكثر من 2 ATR
+    stop3 = max(min(b["l"] for b in bars[-20:]) - 0.25 * a, stop2 - 2.0 * a)
     if stop3 >= stop2:
         stop3 = stop2 - 0.5 * a
     breakout = res[0]["price"] if res else price + a
@@ -866,7 +900,6 @@ def compute_levels(bars, price):
 
 
 def find_fvg(bars, lookback=40):
-    """فجوات القيمة العادلة (FVG) غير المغلقة على الشموع اليومية."""
     out = []
     start = max(2, len(bars) - lookback)
     for i in range(start, len(bars)):
@@ -885,7 +918,6 @@ def find_fvg(bars, lookback=40):
 
 
 def detect_structure(bars):
-    """اتجاه السوق وCHOCH من القمم والقيعان."""
     recent = bars[-90:]
     sw = swing_points(recent, 2)
     highs = [p for _, p, k in sw if k == "H"]
@@ -920,7 +952,6 @@ def find_gaps(bars, lookback=30, min_pct=2.0):
 
 
 def estimate_cvd(bars, n=60):
-    """CVD تقديري من الشموع (وليس تيك حقيقي)."""
     win = bars[-n:]
     cvd, series = 0.0, []
     for b in win:
@@ -954,7 +985,6 @@ def d_str(t):
     return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-# ----- SEC -----
 def sec_get(url):
     return requests.get(url, headers={"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"},
                         timeout=40)
@@ -1025,7 +1055,6 @@ def relevant_excerpts(text, limit=25000):
 
 
 def parse_form4(xml_text):
-    """يرجع (اسم المبلغ، صفته، قائمة العمليات في السوق المفتوح)."""
     root = ET.fromstring(xml_text)
     g = lambda el, path: (el.findtext(path) or "").strip()
     name = g(root, "reportingOwner/reportingOwnerId/rptOwnerName")
@@ -1070,7 +1099,6 @@ def insider_section(cik, filings):
     return "\n".join(lines[:8]) + (f"\n(+{other} عملية أخرى غير سوقية)" if other else "")
 
 
-# ----- أقسام النموذج اللغوي -----
 DIL_SYSTEM = (
     "أنت محلل إفصاحات SEC. اعتماداً على مقتطفات الإفصاحات التالية فقط، استخرج بالعربية:\n"
     "🧾 الوارنتس: العدد وسعر التنفيذ والأجل وتاريخ الإصدار.\n"
@@ -1100,7 +1128,6 @@ def news_section(sym, name):
     return gemini(system, [{"text": q}], 3000, timeout=300, tools=[{"google_search": {}}])
 
 
-# ----- تجميع التقرير -----
 def short_interest_section(rows, float_sh):
     if not rows:
         return "غير متاح (تعذر جلب بيانات NASDAQ)."
@@ -1191,7 +1218,6 @@ def analyze_stock(chat_id, mid, exch, sym):
 
         name = (tv or {}).get("description") or meta.get("longName") or ""
         exch_name = ((tv or {}).get("ticker") or "").split(":")[0] or exch or ""
-        # السعر
         reg = meta.get("regularMarketPrice") or (tv or {}).get("close")
         if intra:
             last = intra[-1]
@@ -1228,7 +1254,6 @@ def analyze_stock(chat_id, mid, exch, sym):
         if info:
             L.append("ℹ️ " + " • ".join(info))
 
-        # المستويات
         if daily and len(daily) >= 30 and now_price:
             status_update(chat_id, sid, f"⏳ جاري حساب المستويات والمؤشرات ({sym})...")
             lv = compute_levels(daily, now_price)
@@ -1238,7 +1263,7 @@ def analyze_stock(chat_id, mid, exch, sym):
         else:
             L += ["", "🎯 خطة التداول: غير متاحة (لا توجد شموع كافية)."]
         L += ["", "🩳 Short Interest (المصدر: NASDAQ)"]
-        # Short interest
+        
         status_update(chat_id, sid, f"⏳ جاري جلب Short Interest وإفصاحات SEC ({sym})...")
         try:
             rows = fetch_nasdaq_short(sym)
@@ -1247,7 +1272,6 @@ def analyze_stock(chat_id, mid, exch, sym):
             notes.append(f"NASDAQ: {short_err(e)}")
         L.append(short_interest_section(rows, to_num((tv or {}).get("float_shares_outstanding"))))
 
-        # SEC: التخفيف والمطلعون
         dil_text, insider_text, cik = None, None, None
         try:
             cik = sec_cik(sym)
@@ -1265,7 +1289,7 @@ def analyze_stock(chat_id, mid, exch, sym):
                     dil_text = gemini(DIL_SYSTEM, [{"text": "\n\n".join(docs)[:200000]}], 4000)
                 insider_text = insider_section(cik, filings)
             else:
-                notes.append("SEC: الرمز غير موجود في قائمة الشركات (قد تكون شركة أجنبية أو صندوقاً)")
+                notes.append("SEC: الرمز غير موجود في قائمة الشركات")
         except Exception as e:
             if isinstance(e, QuotaError):
                 raise
@@ -1274,7 +1298,6 @@ def analyze_stock(chat_id, mid, exch, sym):
               dil_text or "غير متاح (لم تتوفر إفصاحات كافية)."]
         L += ["", "👔 رادار صفقات المطلعين (Form 4)", insider_text or "غير متاح."]
 
-        # الأخبار
         status_update(chat_id, sid, f"⏳ جاري البحث عن الأخبار والمحفزات ({sym})...")
         try:
             L += ["", "📰 الأخبار والمحفزات ونبذة عن الشركة (بحث Google)", news_section(sym, name)]
@@ -1296,7 +1319,6 @@ def analyze_stock(chat_id, mid, exch, sym):
 
 
 def parse_tradingview(url):
-    """يستخرج (البورصة، الرمز) من رابط TradingView."""
     p = urlparse(url)
     q = parse_qs(p.query).get("symbol")
     if q:
@@ -1311,13 +1333,25 @@ def parse_tradingview(url):
     return None, None
 
 
-# ---------- الصور وملفات PDF الممسوحة ----------
+# ---------- الصور وتحليل الشارتات (Live Vision) ----------
+CHART_VISION_SYSTEM = (
+    "أنت محلل فني محترف لأسواق الأسهم. قمت بتلقي صورة شارت (مثل TradingView) أو لقطة شاشة سهم. "
+    "قم باستخراج ومعالجة تفاصيل الشارت بدقة وفق النقاط التالية:\n"
+    "1. 🏷️ اسم أو رمز السهم والمنصة الظاهرة في الشارت.\n"
+    "2. 💵 السعر الحالي ومستويات الدعم (Support) والمقاومة (Resistance) المحددة على الشارت.\n"
+    "3. 📈 المؤشرات التقنية الظاهرة (مثل EMA, VWAP, الحجم/Volume) وقراءاتها الحالية.\n"
+    "4. 🔍 قراءة حركة السعر (Price Action) والاتجاه العام بناءً على الشارت المرئي.\n"
+    "5. 🎯 تقييم سريع وتحليل فني مبني على ما تراه في الصورة مع تنبيه المخاطر.\n"
+    "أجب باللغة العربية الفصحى بشكل منظم وبدون استخدام رموز التنسيق مثل ** أو #."
+)
+
 IMG_SYSTEM = (
     "أنت مترجم محترف ومتخصص في قراءة النصوص من الصور. اقرأ كل النص الظاهر في الصورة بدقة "
     "(عناوين وفقرات وأزرار وجداول وأرقام)، ثم ترجمه إلى العربية الفصحى بأسلوب طبيعي مع الحفاظ على "
     "ترتيبه وتنسيقه. اترك الأسماء والأرقام والرموز كما هي. أعد الترجمة فقط بدون شرح. "
     "إذا كان النص عربياً أصلاً فاكتبه كما هو. إذا لم يوجد نص في الصورة فصفها بإيجاز بالعربية."
 )
+
 IMG_SUMMARY_SYSTEM = (
     "اقرأ كل النص الظاهر في الصورة بدقة ثم لخّصه بالعربية بشكل منظم: "
     "📌 الموضوع، 📋 أهم النقاط (مع الأرقام والأسماء والتواريخ كما وردت)، ✅ الخلاصة. "
@@ -1328,11 +1362,10 @@ IMG_SUMMARY_SYSTEM = (
 
 def wants_summary(caption):
     c = (caption or "").lower()
-    return any(k in c for k in ("تلخيص", "لخص", "لخّص", "summar"))
+    return any(k in c for k in ("تلخيص", "لخص", "لخّص", "summar", "تحليل", "شارت", "chart"))
 
 
 def get_image(msg):
-    """يرجع (file_id, mime) إن كانت الرسالة صورة أو ملف صورة."""
     if msg.get("photo"):
         return msg["photo"][-1]["file_id"], "image/jpeg"
     d = msg.get("document")
@@ -1345,14 +1378,15 @@ def get_image(msg):
 
 
 def process_visual(chat_id, mid, data, mime, title, caption=""):
-    """ترجمة (أو تلخيص) نص صورة أو PDF ممسوح عبر Gemini."""
     import base64
-    sid = status_start(chat_id, "⏳ جاري قراءة النص من الملف وترجمته...", mid)
+    sid = status_start(chat_id, "⏳ جاري قراءة وتحليل الشارت/الصورة بالذكاء الاصطناعي...", mid)
     try:
-        system = IMG_SUMMARY_SYSTEM if wants_summary(caption) else IMG_SYSTEM
+        is_chart = wants_summary(caption) or "صورة" not in title
+        system = CHART_VISION_SYSTEM if is_chart else (IMG_SUMMARY_SYSTEM if wants_summary(caption) else IMG_SYSTEM)
+        
         parts = [
             {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}},
-            {"text": "اقرأ النص في هذا الملف."},
+            {"text": "قم بتحليل هذا الشارت/الصورة المالية واستخرج كافة البيانات بدقة." if is_chart else "اقرأ النص في هذا الملف."},
         ]
         result = gemini(system, parts, 16000, timeout=600)
     finally:
@@ -1365,7 +1399,7 @@ def process_visual(chat_id, mid, data, mime, title, caption=""):
 def handle(msg):
     chat_id = msg["chat"]["id"]
     if str(chat_id) != CHAT_ID:
-        return  # تجاهل أي محادثة غير المحددة في CHAT_ID
+        return
     mid = msg["message_id"]
     text = msg.get("text")
     doc = msg.get("document")
@@ -1389,7 +1423,7 @@ def handle(msg):
             if not data:
                 send(chat_id, "⚠️ تعذر تنزيل الصورة.", mid)
                 return
-            process_visual(chat_id, mid, data, mime, "صورة", msg.get("caption") or "")
+            process_visual(chat_id, mid, data, mime, "شارت سهم", msg.get("caption") or "")
 
         elif text:
             if text.startswith("/start") or text.startswith("/help"):
@@ -1539,7 +1573,6 @@ def main():
                     handle_callback(upd["callback_query"])
             except Exception:
                 print(traceback.format_exc())
-    # تأكيد الرسائل المعالجة حتى لا تتكرر في التشغيل القادم
     if offset:
         tg("getUpdates", offset=offset, timeout=0)
 
