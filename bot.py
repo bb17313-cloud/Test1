@@ -54,6 +54,7 @@ HELP = (
     "📝 أرسل نصاً بأي لغة ← أترجمه إلى العربية.\n"
     "📄 أرسل ملف PDF / Word / TXT ← ألخصه بالعربية (أضف كلمة «ترجمة» في التعليق لترجمته).\n"
     "🔗 أرسل رابطاً (مثل ملفات SEC) ← أفتحه وألخصه (أضف «ترجمة» لترجمته).\n"
+    "🖼 أرسل صورة أو لقطة شاشة ← أستخرج نصها وأترجمه (أضف «تلخيص» في التعليق لتلخيصه).\n"
     "🎙 أرسل رسالة صوتية أو ملف صوت ← أفرّغه وأترجمه.\n"
     "🎬 أرسل فيديو قصير ← أفرّغ كلامه وأترجمه.\n"
     "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...)، أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
@@ -627,6 +628,56 @@ def get_media(msg):
     return None
 
 
+# ---------- الصور وملفات PDF الممسوحة ----------
+IMG_SYSTEM = (
+    "أنت مترجم محترف ومتخصص في قراءة النصوص من الصور. اقرأ كل النص الظاهر في الصورة بدقة "
+    "(عناوين وفقرات وأزرار وجداول وأرقام)، ثم ترجمه إلى العربية الفصحى بأسلوب طبيعي مع الحفاظ على "
+    "ترتيبه وتنسيقه. اترك الأسماء والأرقام والرموز كما هي. أعد الترجمة فقط بدون شرح. "
+    "إذا كان النص عربياً أصلاً فاكتبه كما هو. إذا لم يوجد نص في الصورة فصفها بإيجاز بالعربية."
+)
+IMG_SUMMARY_SYSTEM = (
+    "اقرأ كل النص الظاهر في الصورة بدقة ثم لخّصه بالعربية بشكل منظم: "
+    "📌 الموضوع، 📋 أهم النقاط (مع الأرقام والأسماء والتواريخ كما وردت)، ✅ الخلاصة. "
+    "لا تضف معلومات غير موجودة. لا تستخدم رموز التنسيق مثل ** أو #. "
+    "إذا لم يوجد نص فصف الصورة بإيجاز بالعربية."
+)
+
+
+def wants_summary(caption):
+    c = (caption or "").lower()
+    return any(k in c for k in ("تلخيص", "لخص", "لخّص", "summar"))
+
+
+def get_image(msg):
+    """يرجع (file_id, mime) إن كانت الرسالة صورة أو ملف صورة."""
+    if msg.get("photo"):
+        return msg["photo"][-1]["file_id"], "image/jpeg"
+    d = msg.get("document")
+    if d:
+        name = d.get("file_name", "")
+        mt = d.get("mime_type", "") or guess_mime(name, "")
+        if mt.startswith("image/"):
+            return d["file_id"], mt
+    return None
+
+
+def process_visual(chat_id, mid, data, mime, title, caption=""):
+    """ترجمة (أو تلخيص) نص صورة أو PDF ممسوح عبر Gemini."""
+    import base64
+    sid = status_start(chat_id, "⏳ جاري قراءة النص من الملف وترجمته...", mid)
+    try:
+        system = IMG_SUMMARY_SYSTEM if wants_summary(caption) else IMG_SYSTEM
+        parts = [
+            {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}},
+            {"text": "اقرأ النص في هذا الملف."},
+        ]
+        result = gemini(system, parts, 16000, timeout=600)
+    finally:
+        status_end(chat_id, sid)
+    remember(title, result)
+    send(chat_id, result, mid, markup=keyboard(False))
+
+
 # ---------- معالجة الرسائل ----------
 def handle(msg):
     chat_id = msg["chat"]["id"]
@@ -648,6 +699,14 @@ def handle(msg):
                 send(chat_id, "⚠️ تعذر تنزيل الملف (الحد 20 ميجا). أرسل رابطاً بدلاً منه.", mid)
                 return
             process_media(chat_id, mid, data, name, name)
+
+        elif get_image(msg):
+            file_id, mime = get_image(msg)
+            data = download(file_id)
+            if not data:
+                send(chat_id, "⚠️ تعذر تنزيل الصورة.", mid)
+                return
+            process_visual(chat_id, mid, data, mime, "صورة", msg.get("caption") or "")
 
         elif text:
             if text.startswith("/start") or text.startswith("/help"):
@@ -717,7 +776,10 @@ def handle(msg):
                 send(chat_id, "⚠️ الصيغة غير مدعومة. المدعوم: PDF, DOCX, TXT وملفات الصوت والفيديو.", mid)
                 return
             if not content.strip():
-                send(chat_id, "⚠️ لم أجد نصاً داخل الملف (قد يكون صورة ممسوحة).", mid)
+                if name.lower().endswith(".pdf"):
+                    process_visual(chat_id, mid, data, "application/pdf", name, msg.get("caption") or "")
+                else:
+                    send(chat_id, "⚠️ لم أجد نصاً داخل الملف.", mid)
                 return
             remember(name, content)
             caption = (msg.get("caption") or "").lower()
@@ -727,7 +789,7 @@ def handle(msg):
                 send(chat_id, summarize(content), mid, markup=keyboard())
 
         else:
-            send(chat_id, "أرسل نصاً أو ملفاً (PDF / Word / TXT) أو رسالة صوتية أو فيديو.", mid)
+            send(chat_id, "أرسل نصاً أو صورة أو ملفاً (PDF / Word / TXT) أو رسالة صوتية أو فيديو.", mid)
 
     except Exception as e:
         print(traceback.format_exc())
