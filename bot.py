@@ -9,8 +9,9 @@ import tempfile
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 from pypdf import PdfReader
@@ -59,6 +60,7 @@ HELP = (
     "🎬 أرسل فيديو قصير ← أفرّغ كلامه وأترجمه.\n"
     "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...)، أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
     "⬇️ أضف كلمة «تحميل» مع رابط (X / تيك توك / إنستغرام / فيسبوك...) ← أحمّل الفيديو وأرسله لك.\n"
+    "📊 تحليل سهم أمريكي: أرسل «تحليل UPLD» أو رابط شارت TradingView.\n"
     "💬 بعد أي تلخيص أو تفريغ تظهر أزرار لسؤالي عن أي نقطة في المستند.\n\n"
     "الأوامر:\n"
     "/start - المساعدة\n"
@@ -353,12 +355,14 @@ def friendly_error(e):
     return f"❌ حدث خطأ: {msg[:300]}"
 
 
-def gemini(system, parts, max_tokens=2000, timeout=300):
+def gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
     body = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"maxOutputTokens": max_tokens},
     }
+    if tools:
+        body["tools"] = tools
     headers = {"x-goog-api-key": GEMINI_API_KEY}
     models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
     last_status, last_msg, data = None, "Gemini error", {}
@@ -628,6 +632,685 @@ def get_media(msg):
     return None
 
 
+# ---------- تحليل الأسهم الأمريكية ----------
+UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+TV_COLUMNS_FULL = ["name", "description", "exchange", "type", "country", "sector", "industry", "close",
+                   "change", "volume", "average_volume_10d_calc", "market_cap_basic",
+                   "float_shares_outstanding", "beta_1_year", "earnings_release_next_date",
+                   "premarket_close", "premarket_change", "postmarket_close", "postmarket_change"]
+TV_COLUMNS_CORE = ["name", "description", "exchange", "type", "close", "change", "volume",
+                   "market_cap_basic"]
+CIK_CACHE = {}
+SYMBOL_RE = re.compile(r"^\s*(?:/analy[sz]e|/analysis|تحليل|حلل|analy[sz]e)\s+(?:([A-Za-z]+):)?\$?([A-Za-z][A-Za-z0-9.\-]{0,9})\s*$",
+                       re.I)
+UNAVAILABLE = ("Dark Pool اللحظي، وL2/L3/MBO وBookmap، وIceberg وSweep وWhale Watch وLarge Lot "
+               "وTape Speed وVolume Stripes، والنقاط الكبيرة (Dots)")
+DISCLAIMER = ("⚠️ تنبيه: المستويات محسوبة آلياً من بيانات تاريخية وقد تتأخر الأسعار دقائق، "
+              "وهي أداة مساعدة وليست توصية شراء أو بيع. تأكد من السعر الحي من وسيطك قبل أي قرار.")
+
+
+def http_get_json(url, params=None, headers=None, timeout=30):
+    h = {"User-Agent": UA_BROWSER, "Accept": "application/json, text/plain, */*"}
+    h.update(headers or {})
+    r = requests.get(url, params=params, headers=h, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def to_num(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    t = str(x).replace(",", "").replace("$", "").strip()
+    if t in ("", "N/A", "--", "NaN", "null"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def fmt_p(x):
+    if x is None:
+        return "غير متاح"
+    return f"${x:,.2f}" if abs(x) >= 1 else f"${x:.4f}"
+
+
+def fmt_n(x):
+    if x is None:
+        return "غير متاح"
+    a = abs(x)
+    if a >= 1e9:
+        return f"{x / 1e9:.2f}B"
+    if a >= 1e6:
+        return f"{x / 1e6:.2f}M"
+    return f"{x:,.0f}"
+
+
+def fmt_pct(x, signed=False):
+    if x is None:
+        return "غير متاح"
+    return f"{x:+.2f}%" if signed else f"{x:.2f}%"
+
+
+def short_err(e):
+    msg = str(e)
+    m = re.search(r"(\d{3}) (Client|Server) Error", msg)
+    if m:
+        return f"رُفض الطلب (HTTP {m.group(1)})"
+    return msg[:80]
+
+
+# ----- مصادر البيانات -----
+def fetch_tv(symbol, exchange=None):
+    """بيانات السهم من ماسح TradingView (سعر، حجم، فلوت، بيتا، دولة، موعد الأرباح...)."""
+    def scan(columns):
+        payload = {"filter": [{"left": "name", "operation": "equal", "right": symbol}],
+                   "options": {"lang": "en"}, "markets": ["america"],
+                   "symbols": {"query": {"types": []}, "tickers": []}, "columns": columns,
+                   "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"}, "range": [0, 10]}
+        r = requests.post("https://scanner.tradingview.com/america/scan", json=payload,
+                          headers={"User-Agent": UA_BROWSER}, timeout=30)
+        r.raise_for_status()
+        return r.json().get("data") or []
+
+    try:
+        cols, rows = TV_COLUMNS_FULL, scan(TV_COLUMNS_FULL)
+    except Exception:
+        cols, rows = TV_COLUMNS_CORE, scan(TV_COLUMNS_CORE)   # إن رفض عمود غير معروف
+    if not rows:
+        raise Exception("الرمز غير موجود في TradingView")
+    pick = None
+    if exchange:
+        pick = next((r for r in rows if r["s"].upper().startswith(exchange.upper() + ":")), None)
+    if not pick:
+        pick = next((r for r in rows if "stock" in str(r["d"][cols.index("type")]).lower()), rows[0])
+    d = dict(zip(cols, pick["d"]))
+    d["ticker"] = pick["s"]
+    return d
+
+
+def fetch_yahoo(symbol, interval, range_, prepost=False):
+    """شموع OHLCV من Yahoo Finance. يرجع (bars, meta)."""
+    sym = symbol.replace(".", "-")
+    j = http_get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                      params={"interval": interval, "range": range_,
+                              "includePrePost": "true" if prepost else "false"})
+    res = j["chart"]["result"][0]
+    ts = res.get("timestamp") or []
+    q = res["indicators"]["quote"][0]
+    bars = []
+    for i, t in enumerate(ts):
+        o, h, l, c, v = (q["open"][i], q["high"][i], q["low"][i], q["close"][i], q["volume"][i])
+        if None in (o, h, l, c):
+            continue
+        bars.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v or 0})
+    return bars, res.get("meta") or {}
+
+
+def session_label(meta, t):
+    try:
+        cp = meta["currentTradingPeriod"]
+        if cp["regular"]["start"] <= t < cp["regular"]["end"]:
+            return "الجلسة العادية"
+        if t < cp["regular"]["start"]:
+            return "ما قبل الافتتاح"
+        return "ما بعد الإغلاق"
+    except Exception:
+        return "غير محددة"
+
+
+def fetch_nasdaq_short(symbol):
+    """Short Interest من NASDAQ (يصدر مرتين شهرياً). يرجع قائمة الفترات الأحدث أولاً."""
+    j = http_get_json(f"https://api.nasdaq.com/api/quote/{symbol}/short-interest",
+                      params={"assetClass": "stocks"},
+                      headers={"Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"},
+                      timeout=25)
+    rows = (((j.get("data") or {}).get("shortInterestTable") or {}).get("rows")) or []
+    out = []
+    for r in rows:
+        out.append({"date": r.get("settlementDate"), "si": to_num(r.get("interest")),
+                    "adv": to_num(r.get("avgDailyShareVolume")), "dtc": to_num(r.get("daysToCover"))})
+    return [o for o in out if o["si"] is not None]
+
+
+# ----- المؤشرات الفنية (حسابات بالكود) -----
+def calc_atr(bars, n=14):
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return None
+    last = trs[-n:]
+    return sum(last) / len(last)
+
+
+def swing_points(bars, w=3):
+    pts = []
+    for i in range(w, len(bars) - w):
+        win = bars[i - w:i + w + 1]
+        if bars[i]["h"] == max(b["h"] for b in win):
+            pts.append((i, bars[i]["h"], "H"))
+        if bars[i]["l"] == min(b["l"] for b in win):
+            pts.append((i, bars[i]["l"], "L"))
+    return pts
+
+
+def cluster_levels(prices, tol):
+    clusters = []
+    for p in sorted(prices):
+        if clusters and p - clusters[-1]["max"] <= tol:
+            clusters[-1]["vals"].append(p)
+            clusters[-1]["max"] = p
+        else:
+            clusters.append({"vals": [p], "max": p})
+    return [{"price": sum(c["vals"]) / len(c["vals"]), "touches": len(c["vals"])} for c in clusters]
+
+
+def volume_profile(bars, bins=24):
+    lo, hi = min(b["l"] for b in bars), max(b["h"] for b in bars)
+    if hi <= lo:
+        return None, []
+    step = (hi - lo) / bins
+    vol = [0.0] * bins
+    for b in bars:
+        tp = (b["h"] + b["l"] + b["c"]) / 3
+        vol[min(int((tp - lo) / step), bins - 1)] += b["v"]
+    order = sorted(range(bins), key=lambda i: -vol[i])
+    center = lambda i: lo + (i + 0.5) * step
+    return center(order[0]), [center(i) for i in order[1:3]]
+
+
+def compute_levels(bars, price):
+    """دعوم ومقاومات وأهداف ووقف خسارة من القمم والقيعان ومناطق الحجم وATR."""
+    a = calc_atr(bars) or price * 0.03
+    recent = bars[-120:]
+    tol = max(0.5 * a, price * 0.01)
+    cand = [p for _, p, _ in swing_points(recent, 3)]
+    year = bars[-252:]
+    hi52, lo52 = max(b["h"] for b in year), min(b["l"] for b in year)
+    cand += [hi52, lo52]
+    poc, hvn = volume_profile(recent)
+    if poc:
+        cand += [poc, poc] + hvn
+    cl = cluster_levels(cand, tol)
+    sup = sorted([c for c in cl if c["price"] < price - 0.1 * a], key=lambda c: -c["price"])
+    res = sorted([c for c in cl if c["price"] > price + 0.1 * a], key=lambda c: c["price"])
+
+    s1 = sup[0]["price"] if sup else price - a
+    near = [c for c in sup if price - 5 * a <= c["price"] < s1 - 0.1 * a]
+    strong = max(near, key=lambda c: c["touches"])["price"] if near else (
+        sup[1]["price"] if len(sup) > 1 else s1 - a)
+    targets, atr_based = [c["price"] for c in res[:4]], []
+    last = targets[-1] if targets else price
+    while len(targets) < 4:
+        last += a
+        targets.append(last)
+        atr_based.append(len(targets))
+    extra = hi52 if hi52 > targets[3] else targets[3] + 1.5 * a
+    stop1 = s1 - 0.5 * a
+    stop2 = min(strong, s1) - 0.5 * a
+    if stop2 >= stop1:
+        stop2 = stop1 - 0.5 * a
+    stop3 = max(min(b["l"] for b in bars[-20:]) - 0.25 * a, stop2 - 2.0 * a)  # الوقف الدموي لا يبعد أكثر من 2 ATR
+    if stop3 >= stop2:
+        stop3 = stop2 - 0.5 * a
+    breakout = res[0]["price"] if res else price + a
+    rr = (targets[0] - s1) / (s1 - stop1) if s1 > stop1 else None
+    return {"atr": a, "s1": s1, "strong": strong, "breakout": breakout, "targets": targets,
+            "atr_based": atr_based, "extra": extra, "stops": [stop1, stop2, stop3], "rr": rr,
+            "hi52": hi52, "lo52": lo52, "poc": poc}
+
+
+def find_fvg(bars, lookback=40):
+    """فجوات القيمة العادلة (FVG) غير المغلقة على الشموع اليومية."""
+    out = []
+    start = max(2, len(bars) - lookback)
+    for i in range(start, len(bars)):
+        b0, b2 = bars[i - 2], bars[i]
+        if b2["l"] > b0["h"]:
+            lo, hi, kind = b0["h"], b2["l"], "صاعدة"
+            filled = any(bars[j]["l"] <= lo for j in range(i + 1, len(bars)))
+        elif b2["h"] < b0["l"]:
+            lo, hi, kind = b2["h"], b0["l"], "هابطة"
+            filled = any(bars[j]["h"] >= hi for j in range(i + 1, len(bars)))
+        else:
+            continue
+        if not filled:
+            out.append({"kind": kind, "lo": lo, "hi": hi, "t": bars[i]["t"]})
+    return out[-3:]
+
+
+def detect_structure(bars):
+    """اتجاه السوق وCHOCH من القمم والقيعان."""
+    recent = bars[-90:]
+    sw = swing_points(recent, 2)
+    highs = [p for _, p, k in sw if k == "H"]
+    lows = [p for _, p, k in sw if k == "L"]
+    trend, choch, level = "عرضي", None, None
+    if len(highs) >= 2 and len(lows) >= 2:
+        if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+            trend = "صاعد (قمم وقيعان أعلى)"
+        elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+            trend = "هابط (قمم وقيعان أدنى)"
+        last_close = recent[-1]["c"]
+        if trend.startswith("هابط") and last_close > highs[-1]:
+            choch, level = "صاعد (Bullish CHOCH)", highs[-1]
+        elif trend.startswith("صاعد") and last_close < lows[-1]:
+            choch, level = "هابط (Bearish CHOCH)", lows[-1]
+    return {"trend": trend, "choch": choch, "level": level}
+
+
+def find_gaps(bars, lookback=30, min_pct=2.0):
+    out = []
+    for i in range(max(1, len(bars) - lookback), len(bars)):
+        pc, o = bars[i - 1]["c"], bars[i]["o"]
+        pct = (o - pc) / pc * 100
+        if abs(pct) < min_pct:
+            continue
+        if pct > 0:
+            filled = any(bars[j]["l"] <= pc for j in range(i, len(bars)))
+        else:
+            filled = any(bars[j]["h"] >= pc for j in range(i, len(bars)))
+        out.append({"pct": pct, "t": bars[i]["t"], "filled": filled, "level": pc})
+    return out[-3:]
+
+
+def estimate_cvd(bars, n=60):
+    """CVD تقديري من الشموع (وليس تيك حقيقي)."""
+    win = bars[-n:]
+    cvd, series = 0.0, []
+    for b in win:
+        rng = b["h"] - b["l"]
+        delta = b["v"] * (((b["c"] - b["l"]) - (b["h"] - b["c"])) / rng) if rng > 0 else 0
+        cvd += delta
+        series.append(cvd)
+    return {"value": series[-1], "above_zero": series[-1] > 0,
+            "slope_up": len(series) > 5 and series[-1] > series[-6]}
+
+
+def volume_spikes(bars, lookback=20, mult=2.0):
+    base = bars[-50:-lookback] or bars[:-lookback]
+    avg = sum(b["v"] for b in base) / len(base) if base else 0
+    out = []
+    for b in bars[-lookback:]:
+        if avg and b["v"] > mult * avg:
+            out.append({"t": b["t"], "x": b["v"] / avg, "up": b["c"] >= b["o"]})
+    return out[-4:]
+
+
+def sparkline(values):
+    blocks = "▁▂▃▄▅▆▇█"
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return blocks[0] * len(values)
+    return "".join(blocks[min(int((v - lo) / (hi - lo) * 7), 7)] for v in values)
+
+
+def d_str(t):
+    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+# ----- SEC -----
+def sec_get(url):
+    return requests.get(url, headers={"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"},
+                        timeout=40)
+
+
+def sec_cik(sym):
+    if not CIK_CACHE:
+        r = sec_get("https://www.sec.gov/files/company_tickers.json")
+        r.raise_for_status()
+        for v in r.json().values():
+            CIK_CACHE[v["ticker"].upper()] = int(v["cik_str"])
+    return CIK_CACHE.get(sym.upper())
+
+
+def sec_recent(cik):
+    r = sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json")
+    r.raise_for_status()
+    rec = r.json()["filings"]["recent"]
+    n = len(rec["form"])
+    items = rec.get("items") or [""] * n
+    return [{"form": rec["form"][i], "date": rec["filingDate"][i], "acc": rec["accessionNumber"][i],
+             "doc": rec["primaryDocument"][i], "items": items[i]} for i in range(n)]
+
+
+def sec_url(cik, f, raw=False):
+    doc = f["doc"].split("/")[-1] if raw else f["doc"]
+    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{f['acc'].replace('-', '')}/{doc}"
+
+
+def sec_text(url):
+    r = sec_get(url)
+    r.raise_for_status()
+    raw = r.text
+    if raw.lstrip().startswith("<?xml"):
+        try:
+            return xml_to_text(raw)
+        except Exception:
+            pass
+    return html_to_text(raw)
+
+
+def recent_enough(date_str, days):
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+    return d >= datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def pick_dilution_filings(filings):
+    off = [f for f in filings if f["form"].startswith(("424B", "S-3", "S-1", "F-3", "F-1"))
+           and recent_enough(f["date"], 400)][:2]
+    ev = [f for f in filings if f["form"] == "8-K" and recent_enough(f["date"], 400)
+          and {"1.01", "3.02", "2.03", "3.03", "1.02"} & set((f["items"] or "").split(","))][:2]
+    q = [f for f in filings if f["form"] in ("10-Q", "10-K")][:1]
+    return off + ev + q
+
+
+DIL_KEYWORDS = ("warrant", "convertible", "conversion price", "exercise price", "at-the-market",
+                "at the market", "shelf", "offering", "dilut", "going concern", "preferred",
+                "senior notes", "term loan", "authorized shares", "registered direct", "private placement")
+
+
+def relevant_excerpts(text, limit=25000):
+    keep = [p for p in text.split("\n") if p.strip() and any(k in p.lower() for k in DIL_KEYWORDS)]
+    out = "\n".join(keep) if keep else text
+    return out[:limit]
+
+
+def parse_form4(xml_text):
+    """يرجع (اسم المبلغ، صفته، قائمة العمليات في السوق المفتوح)."""
+    root = ET.fromstring(xml_text)
+    g = lambda el, path: (el.findtext(path) or "").strip()
+    name = g(root, "reportingOwner/reportingOwnerId/rptOwnerName")
+    rel = root.find("reportingOwner/reportingOwnerRelationship")
+    role = ""
+    if rel is not None:
+        role = g(rel, "officerTitle") or ("عضو مجلس إدارة" if g(rel, "isDirector") in ("1", "true") else "")
+        if not role and g(rel, "isTenPercentOwner") in ("1", "true"):
+            role = "مالك +10%"
+    txs = []
+    for t in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        code = g(t, "transactionCoding/transactionCode")
+        sh = to_num(g(t, "transactionAmounts/transactionShares/value"))
+        px = to_num(g(t, "transactionAmounts/transactionPricePerShare/value"))
+        txs.append({"date": g(t, "transactionDate/value"), "code": code, "shares": sh, "price": px})
+    return name, role, txs
+
+
+def insider_section(cik, filings):
+    f4 = [f for f in filings if f["form"] == "4" and recent_enough(f["date"], 120)][:8]
+    lines, other = [], 0
+    for f in f4:
+        try:
+            r = sec_get(sec_url(cik, f, raw=True))
+            r.raise_for_status()
+            name, role, txs = parse_form4(r.text)
+        except Exception:
+            continue
+        for t in txs:
+            if t["code"] in ("P", "S") and t["shares"]:
+                kind = "🟢 شراء" if t["code"] == "P" else "🔴 بيع"
+                val = f" (≈ {fmt_n(t['shares'] * t['price'] * 1.0)}$)" if t["price"] else ""
+                lines.append(f"• {t['date']} {kind}: {name}{' - ' + role if role else ''} — "
+                             f"{fmt_n(t['shares'])} سهم @ {fmt_p(t['price'])}{val}")
+            else:
+                other += 1
+    if not f4:
+        return "لا توجد نماذج Form 4 خلال آخر 120 يوماً."
+    if not lines:
+        return "لا توجد عمليات شراء أو بيع في السوق المفتوح ضمن آخر النماذج" + (
+            f" (يوجد {other} عملية أخرى مثل منح أسهم أو ضرائب)." if other else ".")
+    return "\n".join(lines[:8]) + (f"\n(+{other} عملية أخرى غير سوقية)" if other else "")
+
+
+# ----- أقسام النموذج اللغوي -----
+DIL_SYSTEM = (
+    "أنت محلل إفصاحات SEC. اعتماداً على مقتطفات الإفصاحات التالية فقط، استخرج بالعربية:\n"
+    "🧾 الوارنتس: العدد وسعر التنفيذ والأجل وتاريخ الإصدار.\n"
+    "📜 الأوراق والسندات القابلة للتحويل: المبلغ وسعر التحويل والفائدة والاستحقاق.\n"
+    "🏦 الطروحات (ATM / Shelf / طرح مباشر / PIPE): الحجم وسعر الطرح والجهة.\n"
+    "📉 السيولة ومخاطر التخفيف: النقد والدين وشكوك الاستمرارية والأسهم المصرح بها.\n"
+    "اذكر بعد كل معلومة النموذج وتاريخه بين قوسين، مثل (424B5 بتاريخ 2026-09-01). "
+    "إن لم يرد بند فاكتب: لم يرد في الإفصاحات المفحوصة. لا تخمّن ولا تكمل من ذاكرتك. "
+    "اختم بسطر: ⚠️ مستوى مخاطر التخفيف: منخفض/متوسط/مرتفع مع جملة تبرير مستندة للنص. "
+    "اكتب نقاطاً قصيرة بدون رموز تنسيق مثل ** أو #."
+)
+
+
+def news_section(sym, name):
+    system = (
+        "أنت محلل أسهم. استخدم البحث في الإنترنت للإجابة بالعربية بإيجاز ودقة مع ذكر التاريخ لكل خبر، "
+        "ولا تخترع معلومات؛ إن لم تجد شيئاً فاكتب «لم أجد». اتبع هذا القالب:\n"
+        "📰 أهم الأخبار (آخر 30 يوماً)\n"
+        "🚀 المحفزات القادمة (Forward Catalysts): أرباح، توجيهات، موافقات، عقود\n"
+        "📊 أداء الأرباح: هل تجاوزت الشركة التوقعات (Beat) آخر ربعين، وهل توجيهاتها متحفظة (Sandbagging)\n"
+        "🏢 نشاط الشركة في سطرين\n"
+        "🌍 الدولة (مقر الشركة)\n"
+        "🔁 هل هي مدرجة في بورصات أخرى؟ اذكرها\n"
+        "بدون رموز تنسيق مثل ** أو #."
+    )
+    q = f"السهم الأمريكي {sym}" + (f" ({name})" if name else "")
+    return gemini(system, [{"text": q}], 3000, timeout=300, tools=[{"google_search": {}}])
+
+
+# ----- تجميع التقرير -----
+def short_interest_section(rows, float_sh):
+    if not rows:
+        return "غير متاح (تعذر جلب بيانات NASDAQ)."
+    cur = rows[0]
+    prev = rows[1] if len(rows) > 1 else None
+    dtc = cur["dtc"] if cur["dtc"] is not None else (cur["si"] / cur["adv"] if cur["adv"] else None)
+    pct = cur["si"] / float_sh * 100 if float_sh else None
+    lines = [f"• Short Interest Ratio (أيام التغطية): {dtc:.2f}" if dtc is not None
+             else "• Short Interest Ratio: غير متاح",
+             f"• Short Interest %: {pct:.2f}% من الأسهم الحرة (Float)" if pct is not None
+             else "• Short Interest %: غير متاح (الفلوت غير متوفر)",
+             f"• الأسهم المباعة على المكشوف: {fmt_n(cur['si'])} • متوسط الحجم اليومي: {fmt_n(cur['adv'])}",
+             f"• تاريخ التسوية: {cur['date']}"]
+    if prev and prev["si"]:
+        ch = (cur["si"] - prev["si"]) / prev["si"] * 100
+        lines.append(f"• التغير عن الفترة السابقة ({prev['date']}): {ch:+.1f}% "
+                     f"({'ارتفع' if ch > 0 else 'انخفض'} {fmt_n(abs(cur['si'] - prev['si']))} سهم)")
+    lines.append("المصدر: NASDAQ (يصدر مرتين شهرياً، فهو ليس لحظياً). النسبة المئوية = الأسهم المكشوفة ÷ الفلوت.")
+    return "\n".join(lines)
+
+
+def build_plan(lv, price):
+    t = lv["targets"]
+    mark = lambda i: " (تقديري بـ ATR)" if (i + 1) in lv["atr_based"] else ""
+    L = ["🎯 خطة التداول (مستويات فنية محسوبة)",
+         f"📍 دخول من الدعم: {fmt_p(lv['s1'])} • الدعم القوي: {fmt_p(lv['strong'])}",
+         f"📍 أو اختراق فوق: {fmt_p(lv['breakout'])}",
+         f"🎯 هدف أول: {fmt_p(t[0])}{mark(0)}",
+         f"🎯 هدف ثاني: {fmt_p(t[1])}{mark(1)}",
+         f"🎯 هدف ثالث: {fmt_p(t[2])}{mark(2)}",
+         f"🎯 هدف رابع: {fmt_p(t[3])}{mark(3)}",
+         f"🟢 وقد يصل إلى: {fmt_p(lv['extra'])}",
+         f"⛔ وقف أولي: {fmt_p(lv['stops'][0])} • ثاني: {fmt_p(lv['stops'][1])} • دموي: {fmt_p(lv['stops'][2])}"]
+    if lv["rr"]:
+        L.append(f"⚖️ العائد/المخاطرة (دعم ← هدف 1 مقابل الوقف الأولي): {lv['rr']:.1f} : 1")
+    L.append(f"(ATR(14) = {fmt_p(lv['atr'])} • قمة 52 أسبوع {fmt_p(lv['hi52'])} • قاع {fmt_p(lv['lo52'])})")
+    return "\n".join(L)
+
+
+def build_action(daily, price, cvd, structure, fvg, gaps, spikes):
+    L = ["🔍 سلوك السعر (Price Action Audit)",
+         f"• الاتجاه: {structure['trend']}"]
+    if structure["choch"]:
+        L.append(f"• CHOCH: نعم — {structure['choch']} عند {fmt_p(structure['level'])}")
+    else:
+        L.append("• CHOCH: لا")
+    if fvg:
+        L.append("• FVG: نعم — " + "، ".join(
+            f"{f['kind']} {fmt_p(f['lo'])}–{fmt_p(f['hi'])} ({d_str(f['t'])})" for f in fvg))
+    else:
+        L.append("• FVG: لا توجد فجوات غير مغلقة حديثة")
+    if gaps:
+        L.append("• الفجوات السعرية: " + "، ".join(
+            f"{g['pct']:+.1f}% في {d_str(g['t'])} ({'مغلقة' if g['filled'] else 'مفتوحة'})" for g in gaps))
+    else:
+        L.append("• الفجوات السعرية (≥2%): لا توجد خلال 30 يوماً")
+    L.append(f"• CVD (تقدير من الشموع) فوق الصفر؟ {'نعم' if cvd['above_zero'] else 'لا'} "
+             f"• الميل: {'صاعد' if cvd['slope_up'] else 'هابط'}")
+    if spikes:
+        L.append("• شموع بحجم ضخم (مؤشر على نشاط الحيتان): " + "، ".join(
+            f"{d_str(s['t'])} ({s['x']:.1f}× المتوسط {'↑' if s['up'] else '↓'})" for s in spikes))
+    spark = sparkline([b["c"] for b in daily[-30:]])
+    L.append(f"• آخر 30 يوماً: {spark}")
+    return "\n".join(L)
+
+
+def analyze_stock(chat_id, mid, exch, sym):
+    sym = sym.upper()
+    sid = status_start(chat_id, f"⏳ جاري تحليل {sym} (جلب الأسعار)...", mid)
+    notes = []
+    try:
+        tv = daily = intra = None
+        meta = {}
+        try:
+            tv = fetch_tv(sym, exch)
+        except Exception as e:
+            notes.append(f"TradingView: {short_err(e)}")
+        try:
+            daily, _ = fetch_yahoo(sym, "1d", "1y")
+        except Exception as e:
+            notes.append(f"Yahoo (يومي): {short_err(e)}")
+        try:
+            intra, meta = fetch_yahoo(sym, "5m", "5d", prepost=True)
+        except Exception as e:
+            notes.append(f"Yahoo (ممتد): {short_err(e)}")
+        if not tv and not daily:
+            raise Exception(f"تعذر جلب بيانات {sym}. تأكد من الرمز، أو حاول بعد قليل.")
+
+        name = (tv or {}).get("description") or meta.get("longName") or ""
+        exch_name = ((tv or {}).get("ticker") or "").split(":")[0] or exch or ""
+        # السعر
+        reg = meta.get("regularMarketPrice") or (tv or {}).get("close")
+        if intra:
+            last = intra[-1]
+            now_price, label, when = last["c"], session_label(meta, last["t"]), last["t"]
+        else:
+            now_price, label, when = reg, "غير محددة", None
+        if now_price is None and daily:
+            now_price = daily[-1]["c"]
+        L = [f"📊 تحليل {sym}" + (f" ({exch_name})" if exch_name else "") + (f" — {name}" if name else "")]
+        price_line = f"💵 السعر: {fmt_p(now_price)} ({label})"
+        if reg and now_price and abs(now_price - reg) > 1e-9:
+            price_line += f" • إغلاق/سعر الجلسة العادية {fmt_p(reg)} ({fmt_pct((now_price - reg) / reg * 100, True)} ممتد)"
+        if tv and tv.get("change") is not None:
+            price_line += f" • تغير اليوم {fmt_pct(to_num(tv['change']), True)}"
+        L.append(price_line)
+        if when:
+            L.append(f"🕒 آخر تحديث للبيانات: {datetime.fromtimestamp(when, tz=timezone.utc):%Y-%m-%d %H:%M} UTC (قد يتأخر دقائق)")
+        info = []
+        if tv:
+            if tv.get("volume") is not None:
+                info.append(f"الحجم {fmt_n(to_num(tv['volume']))}")
+            if tv.get("market_cap_basic"):
+                info.append(f"القيمة السوقية {fmt_n(to_num(tv['market_cap_basic']))}$")
+            if tv.get("float_shares_outstanding"):
+                info.append(f"الفلوت {fmt_n(to_num(tv['float_shares_outstanding']))}")
+            if tv.get("beta_1_year") is not None:
+                info.append(f"بيتا {to_num(tv['beta_1_year']):.2f}")
+            if tv.get("earnings_release_next_date"):
+                info.append("الأرباح القادمة " + d_str(int(tv["earnings_release_next_date"])))
+            if tv.get("country"):
+                info.append(f"الدولة {tv['country']}")
+            if tv.get("sector"):
+                info.append(f"القطاع {tv['sector']}")
+        if info:
+            L.append("ℹ️ " + " • ".join(info))
+
+        # المستويات
+        if daily and len(daily) >= 30 and now_price:
+            status_update(chat_id, sid, f"⏳ جاري حساب المستويات والمؤشرات ({sym})...")
+            lv = compute_levels(daily, now_price)
+            L += ["", build_plan(lv, now_price), "",
+                  build_action(daily, now_price, estimate_cvd(daily), detect_structure(daily),
+                               find_fvg(daily), find_gaps(daily), volume_spikes(daily))]
+        else:
+            L += ["", "🎯 خطة التداول: غير متاحة (لا توجد شموع كافية)."]
+        L += ["", "🩳 Short Interest (المصدر: NASDAQ)"]
+        # Short interest
+        status_update(chat_id, sid, f"⏳ جاري جلب Short Interest وإفصاحات SEC ({sym})...")
+        try:
+            rows = fetch_nasdaq_short(sym)
+        except Exception as e:
+            rows = []
+            notes.append(f"NASDAQ: {short_err(e)}")
+        L.append(short_interest_section(rows, to_num((tv or {}).get("float_shares_outstanding"))))
+
+        # SEC: التخفيف والمطلعون
+        dil_text, insider_text, cik = None, None, None
+        try:
+            cik = sec_cik(sym)
+            if cik:
+                filings = sec_recent(cik)
+                docs = []
+                for f in pick_dilution_filings(filings):
+                    try:
+                        docs.append(f"=== {f['form']} بتاريخ {f['date']} ===\n"
+                                    + relevant_excerpts(sec_text(sec_url(cik, f))))
+                    except Exception as e:
+                        notes.append(f"SEC {f['form']}: {short_err(e)}")
+                if docs:
+                    status_update(chat_id, sid, f"⏳ جاري تحليل الوارنتس والتخفيف ({sym})...")
+                    dil_text = gemini(DIL_SYSTEM, [{"text": "\n\n".join(docs)[:200000]}], 4000)
+                insider_text = insider_section(cik, filings)
+            else:
+                notes.append("SEC: الرمز غير موجود في قائمة الشركات (قد تكون شركة أجنبية أو صندوقاً)")
+        except Exception as e:
+            if isinstance(e, QuotaError):
+                raise
+            notes.append(f"SEC: {short_err(e)}")
+        L += ["", "📑 الوارنتس والإصدارات والتخفيف (من إفصاحات SEC)",
+              dil_text or "غير متاح (لم تتوفر إفصاحات كافية)."]
+        L += ["", "👔 رادار صفقات المطلعين (Form 4)", insider_text or "غير متاح."]
+
+        # الأخبار
+        status_update(chat_id, sid, f"⏳ جاري البحث عن الأخبار والمحفزات ({sym})...")
+        try:
+            L += ["", "📰 الأخبار والمحفزات ونبذة عن الشركة (بحث Google)", news_section(sym, name)]
+        except QuotaError:
+            raise
+        except Exception as e:
+            notes.append(f"الأخبار: {short_err(e)}")
+            L += ["", "📰 الأخبار والمحفزات: غير متاحة حالياً."]
+
+        L += ["", f"🚫 غير متاح لأنه يتطلب بيانات مدفوعة: {UNAVAILABLE}."]
+        if notes:
+            L += ["", "ملاحظات المصادر: " + " | ".join(notes)]
+        L += ["", DISCLAIMER]
+        report = "\n".join(L)
+    finally:
+        status_end(chat_id, sid)
+    remember(f"تحليل {sym}", report)
+    send(chat_id, report, mid, markup=keyboard(False))
+
+
+def parse_tradingview(url):
+    """يستخرج (البورصة، الرمز) من رابط TradingView."""
+    p = urlparse(url)
+    q = parse_qs(p.query).get("symbol")
+    if q:
+        sym = unquote(q[0])
+        if ":" in sym:
+            e, s = sym.split(":", 1)
+            return e, s
+        return None, sym
+    m = re.search(r"/symbols/([A-Za-z0-9_]+)-([A-Za-z0-9._]+)", p.path)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
 # ---------- الصور وملفات PDF الممسوحة ----------
 IMG_SYSTEM = (
     "أنت مترجم محترف ومتخصص في قراءة النصوص من الصور. اقرأ كل النص الظاهر في الصورة بدقة "
@@ -731,10 +1414,19 @@ def handle(msg):
                 else:
                     remember("نص مرسل", body)
                     send(chat_id, summarize(body), mid, markup=keyboard())
+            elif not URL_RE.search(text) and SYMBOL_RE.match(text):
+                m = SYMBOL_RE.match(text)
+                analyze_stock(chat_id, mid, m.group(1), m.group(2))
             elif URL_RE.search(text):
                 url = URL_RE.search(text).group(0)
                 want_download = "تحميل" in text or "download" in text.lower()
-                if want_download and (is_video_site(url) or YT_RE.search(url)):
+                if "tradingview.com" in url.lower():
+                    e, sy = parse_tradingview(url)
+                    if sy:
+                        analyze_stock(chat_id, mid, e, sy)
+                    else:
+                        send(chat_id, "⚠️ هذا الرابط لا يحتوي على رمز السهم. أرسل: تحليل UPLD", mid)
+                elif want_download and (is_video_site(url) or YT_RE.search(url)):
                     process_video_download(chat_id, mid, url)
                 elif YT_RE.search(url):
                     process_youtube(chat_id, mid, url)
