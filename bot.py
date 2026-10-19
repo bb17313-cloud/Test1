@@ -67,7 +67,7 @@ HELP = (
     "🎬 أرسل فيديو قصير ← أفرّغ كلامه وأترجمه.\n"
     "▶️ أرسل رابط يوتيوب، أو رابط فيديو من (X / تيك توك / فيسبوك / إنستغرام / فيميو...), أو رابط ملف صوت/فيديو مباشر ← أفرّغه وأترجمه.\n\n"
     "⬇️ أضف كلمة «تحميل» مع رابط (X / تيك توك / إنستغرام / فيسبوك...) ← أحمّل الفيديو وأرسله لك.\n"
-    "📊 تحليل سهم أمريكي: أرسل «تحليل UPLD» أو رابط شارت TradingView.\n"
+    "📊 تحليل سهم (أمريكي أو سعودي): أرسل «تحليل UPLD» أو «تحليل 4263» أو رابط شارت TradingView.\n"
     "💬 بعد أي تلخيص أو تفريغ تظهر أزرار لسؤالي عن أي نقطة في المستند.\n\n"
     "الأوامر:\n"
     "/start - المساعدة\n"
@@ -400,12 +400,10 @@ def call_gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
         body["tools"] = tools
     headers = {"x-goog-api-key": GEMINI_API_KEY}
     
-    # دمج النموذج الأساسي مع النماذج الاحتياطية وإزالة التكرار لضمان الانتقال التلقائي السلس
     all_models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
-    
     last_status, last_msg, data = None, "Gemini error", {}
     
-    for model_idx, model in enumerate(all_models):
+    for model in all_models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         attempts = 2
         model_failed = False
@@ -424,7 +422,6 @@ def call_gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
                 last_status = r.status_code
                 last_msg = data.get("error", {}).get("message", "Gemini error")
                 
-                # إذا ظهر خطأ استهلاك الحد (429) أو خطأ في الخادم، نحاول إعادة المحاولة أو الانتقال للنموذج التالي
                 if r.status_code in (429, 500, 503):
                     if attempt < attempts - 1:
                         time.sleep(3)
@@ -432,7 +429,6 @@ def call_gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
                     model_failed = True
                     break
                 elif r.status_code == 404:
-                    # النموذج غير متاح أو خطأ في الاسم، ننتقل مباشرة للنموذج الاحتياطي التالي
                     model_failed = True
                     break
                 else:
@@ -445,8 +441,6 @@ def call_gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
                 break
                 
         if model_failed:
-            # إذا فشل النموذج الحالي، يتم الانتقال تلقائياً للنموذج التالي في الحلقة التكرارية
-            print(f"Model {model} failed (Status: {last_status}), switching to next fallback model...")
             continue
 
     if last_status == 429:
@@ -517,24 +511,16 @@ def translate(text):
 def summarize(text, sec=False):
     if sec:
         system = (
-            "أنت محلل أسهم أمريكية محترف. اقرأ إفصاح SEC كاملاً ولخّصه بالعربية بشكل مفصّل ودقيق "
+            "أنت محلل أسهم محترف. اقرأ الإفصاح كاملاً ولخّصه بالعربية بشكل مفصّل ودقيق "
             "(وليس مختصراً)، بحيث يغني المتداول عن قراءة المستند.\n\n"
-            "ابدأ بسطرين: نوع النموذج وفترته، ثم اسم الشركة ورمزها.\n"
-            "ثم اختر الأقسام المناسبة لنوع النموذج من القائمة التالية، واذكر كل قسم بعنوان واضح تسبقه رمز تعبيري:\n"
-            "• نبذة عن الشركة: نشاطها وقطاعاتها الرئيسية وما تقدمه كل شركة تابعة أو قطاع.\n"
-            "• النتائج المالية: الإيرادات، صافي الدخل، ربحية السهم، الأقساط أو المبيعات، "
-            "التدفق النقدي، الديون والسيولة، مع المقارنة بالفترة السابقة ونسبة التغير.\n"
-            "• أداء القطاعات: أرقام كل قطاع وأسباب تحسنه أو تراجعه.\n"
-            "• الأحداث والقرارات المهمة: صفقات، استحواذات، تمويل، طرح أسهم، تغييرات إدارة، دعاوى قضائية.\n"
-            "• المخاطر والتحذيرات: ضعف الرقابة الداخلية، تأخر التقارير، مخاطر الإدراج أو الشطب، شكوك الاستمرارية، "
-            "إعادة عرض الأرقام، أي ملاحظات من المدقق.\n"
-            "• تفاصيل الملكية والأسهم (لنماذج 13G/13D/Form 4): من الجهة، عدد الأسهم، النسبة، التواريخ، سعر العملية.\n"
-            "• تفاصيل الطرح (لنماذج S-3/S-1/424B): حجم الطرح، السعر، الجهة البائعة، الاستخدام المتوقع للأموال، التخفيف المحتمل.\n"
-            "• التواريخ المهمة القادمة.\n"
+            "ابدأ بسطرين: نوع المستند وفترته، ثم اسم الشركة ورمزها.\n"
+            "ثم اختر الأقسام المناسبة، واذكر كل قسم بعنوان واضح تسبقه رمز تعبيري:\n"
+            "• نبذة عن الشركة: نشاطها وقطاعاتها الرئيسية.\n"
+            "• النتائج المالية: الإيرادات، صافي الدخل، ربحية السهم، التدفق النقدي، الديون والسيولة.\n"
+            "• الأحداث والقرارات المهمة: صفقات، استحواذات، تمويل، تغييرات إدارة.\n"
+            "• المخاطر والتحذيرات.\n"
             "💡 الخلاصة: فقرة من 3 إلى 4 جمل تشرح الصورة العامة وما يهم المتداول، بدون توصية شراء أو بيع.\n\n"
-            "قواعد: اكتب الأرقام كما وردت في المستند مع الوحدة والسنة، ولا تقرّبها أو تخمّنها. "
-            "لا تضف معلومة غير موجودة في المستند، واحذف أي قسم لا تتوفر له بيانات. "
-            "استخدم نقاطاً (•) وأسطراً قصيرة، ولا تستخدم رموز التنسيق مثل ** أو #."
+            "قواعد: اكتب الأرقام كما وردت في المستند مع الوحدة والسنة، ولا تقرّبها أو تخمّنها."
         )
     else:
         system = (
@@ -697,7 +683,7 @@ def get_media(msg):
     return None
 
 
-# ---------- تحليل الأسهم الأمريكية ----------
+# ---------- تحليل الأسهم الأمريكية والسعودية ----------
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 TV_COLUMNS_FULL = ["name", "description", "exchange", "type", "country", "sector", "industry", "close",
@@ -707,8 +693,11 @@ TV_COLUMNS_FULL = ["name", "description", "exchange", "type", "country", "sector
 TV_COLUMNS_CORE = ["name", "description", "exchange", "type", "close", "change", "volume",
                    "market_cap_basic"]
 CIK_CACHE = {}
-SYMBOL_RE = re.compile(r"^\s*(?:/analy[sz]e|/analysis|تحليل|حلل|analy[sz]e)\s+(?:([A-Za-z]+):)?\$?([A-Za-z][A-Za-z0-9.\-]{0,9})\s*$",
+
+# تحديث النمط ليدعم الرموز الحرفية الأمريكية والأرقام السعودية (مثل 4263)
+SYMBOL_RE = re.compile(r"^\s*(?:/analy[sz]e|/analysis|تحليل|حلل|analy[sz]e)\s+(?:([A-Za-z]+):)?\$?([A-Za-z0-9.\-]{1,10})\s*$",
                        re.I)
+
 UNAVAILABLE = ("Dark Pool اللحظي، وL2/L3/MBO وBookmap، وIceberg وSweep وWhale Watch وLarge Lot "
                "وTape Speed وVolume Stripes، والنقاط الكبيرة (Dots)")
 DISCLAIMER = ("⚠️ تنبيه: المستويات محسوبة آلياً من بيانات تاريخية وقد تتأخر الأسعار دقائق، "
@@ -769,12 +758,16 @@ def short_err(e):
 
 
 def fetch_tv(symbol, exchange=None):
+    is_saudi = exchange and exchange.upper() in ("TADAWUL", "SAUDI")
+    market = "saudi" if is_saudi else "america"
+    scanner_url = f"https://scanner.tradingview.com/{market}/scan"
+
     def scan(columns):
         payload = {"filter": [{"left": "name", "operation": "equal", "right": symbol}],
-                   "options": {"lang": "en"}, "markets": ["america"],
+                   "options": {"lang": "en"}, "markets": [market],
                    "symbols": {"query": {"types": []}, "tickers": []}, "columns": columns,
                    "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"}, "range": [0, 10]}
-        r = requests.post("https://scanner.tradingview.com/america/scan", json=payload,
+        r = requests.post(scanner_url, json=payload,
                           headers={"User-Agent": UA_BROWSER}, timeout=30)
         r.raise_for_status()
         return r.json().get("data") or []
@@ -795,8 +788,12 @@ def fetch_tv(symbol, exchange=None):
     return d
 
 
-def fetch_yahoo(symbol, interval, range_, prepost=False):
+def fetch_yahoo(symbol, interval, range_, prepost=False, exchange=None):
     sym = symbol.replace(".", "-")
+    is_saudi = exchange and exchange.upper() in ("TADAWUL", "SAUDI")
+    if is_saudi and not sym.endswith(".SR"):
+        sym += ".SR"
+        
     j = http_get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
                       params={"interval": interval, "range": range_,
                               "includePrePost": "true" if prepost else "false"})
@@ -1137,19 +1134,19 @@ DIL_SYSTEM = (
 )
 
 
-def news_section(sym, name):
+def news_section(sym, name, is_saudi=False):
     system = (
         "أنت محلل أسهم. استخدم البحث في الإنترنت للإجابة بالعربية بإيجاز ودقة مع ذكر التاريخ لكل خبر، "
         "ولا تخترع معلومات؛ إن لم تجد شيئاً فاكتب «لم أجد». اتبع هذا القالب:\n"
         "📰 أهم الأخبار (آخر 30 يوماً)\n"
         "🚀 المحفزات القادمة (Forward Catalysts): أرباح، توجيهات، موافقات، عقود\n"
-        "📊 أداء الأرباح: هل تجاوزت الشركة التوقعات (Beat) آخر ربعين، وهل توجيهاتها متحفظة (Sandbagging)\n"
+        "📊 أداء الأرباح: هل تجاوزت الشركة التوقعات (Beat) آخر ربعين\n"
         "🏢 نشاط الشركة في سطرين\n"
         "🌍 الدولة (مقر الشركة)\n"
-        "🔁 هل هي مدرجة في بورصات أخرى؟ اذكرها\n"
         "بدون رموز تنسيق مثل ** أو #."
     )
-    q = f"السهم الأمريكي {sym}" + (f" ({name})" if name else "")
+    market_type = "السهم السعودي (تداول)" if is_saudi else "السهم الأمريكي"
+    q = f"{market_type} {sym}" + (f" ({name})" if name else "")
     return gemini(system, [{"text": q}], 3000, timeout=300, tools=[{"google_search": {}}])
 
 
@@ -1221,7 +1218,10 @@ def build_action(daily, price, cvd, structure, fvg, gaps, spikes):
 
 def analyze_stock(chat_id, mid, exch, sym):
     sym = sym.upper()
-    sid = status_start(chat_id, f"⏳ جاري تحليل {sym} (جلب الأسعار)...", mid)
+    is_saudi = exch and exch.upper() in ("TADAWUL", "SAUDI")
+    market_label = "السعودي" if is_saudi else "الأمريكي"
+    
+    sid = status_start(chat_id, f"⏳ جاري تحليل السهم {market_label} {sym} (جلب الأسعار)...", mid)
     notes = []
     try:
         tv = daily = intra = None
@@ -1231,18 +1231,18 @@ def analyze_stock(chat_id, mid, exch, sym):
         except Exception as e:
             notes.append(f"TradingView: {short_err(e)}")
         try:
-            daily, _ = fetch_yahoo(sym, "1d", "1y")
+            daily, _ = fetch_yahoo(sym, "1d", "1y", exchange=exch)
         except Exception as e:
             notes.append(f"Yahoo (يومي): {short_err(e)}")
         try:
-            intra, meta = fetch_yahoo(sym, "5m", "5d", prepost=True)
+            intra, meta = fetch_yahoo(sym, "5m", "5d", prepost=True, exchange=exch)
         except Exception as e:
             notes.append(f"Yahoo (ممتد): {short_err(e)}")
         if not tv and not daily:
             raise Exception(f"تعذر جلب بيانات {sym}. تأكد من الرمز، أو حاول بعد قليل.")
 
         name = (tv or {}).get("description") or meta.get("longName") or ""
-        exch_name = ((tv or {}).get("ticker") or "").split(":")[0] or exch or ""
+        exch_name = ((tv or {}).get("ticker") or "").split(":")[0] or exch or ("TADAWUL" if is_saudi else "US")
         reg = meta.get("regularMarketPrice") or (tv or {}).get("close")
         if intra:
             last = intra[-1]
@@ -1251,15 +1251,17 @@ def analyze_stock(chat_id, mid, exch, sym):
             now_price, label, when = reg, "غير محددة", None
         if now_price is None and daily:
             now_price = daily[-1]["c"]
-        L = [f"📊 تحليل {sym}" + (f" ({exch_name})" if exch_name else "") + (f" — {name}" if name else "")]
+            
+        L = [f"📊 تحليل السهم {market_label} {sym}" + (f" ({exch_name})" if exch_name else "") + (f" — {name}" if name else "")]
         price_line = f"💵 السعر: {fmt_p(now_price)} ({label})"
         if reg and now_price and abs(now_price - reg) > 1e-9:
-            price_line += f" • إغلاق/سعر الجلسة العادية {fmt_p(reg)} ({fmt_pct((now_price - reg) / reg * 100, True)} ممتد)"
+            price_line += f" • إغلاق الجلسة {fmt_p(reg)} ({fmt_pct((now_price - reg) / reg * 100, True)})"
         if tv and tv.get("change") is not None:
             price_line += f" • تغير اليوم {fmt_pct(to_num(tv['change']), True)}"
         L.append(price_line)
         if when:
-            L.append(f"🕒 آخر تحديث للبيانات: {datetime.fromtimestamp(when, tz=timezone.utc):%Y-%m-%d %H:%M} UTC (قد يتأخر دقائق)")
+            L.append(f"🕒 آخر تحديث: {datetime.fromtimestamp(when, tz=timezone.utc):%Y-%m-%d %H:%M} UTC")
+            
         info = []
         if tv:
             if tv.get("volume") is not None:
@@ -1270,8 +1272,6 @@ def analyze_stock(chat_id, mid, exch, sym):
                 info.append(f"الفلوت {fmt_n(to_num(tv['float_shares_outstanding']))}")
             if tv.get("beta_1_year") is not None:
                 info.append(f"بيتا {to_num(tv['beta_1_year']):.2f}")
-            if tv.get("earnings_release_next_date"):
-                info.append("الأرباح القادمة " + d_str(int(tv["earnings_release_next_date"])))
             if tv.get("country"):
                 info.append(f"الدولة {tv['country']}")
             if tv.get("sector"):
@@ -1280,52 +1280,56 @@ def analyze_stock(chat_id, mid, exch, sym):
             L.append("ℹ️ " + " • ".join(info))
 
         if daily and len(daily) >= 30 and now_price:
-            status_update(chat_id, sid, f"⏳ جاري حساب المستويات والمؤشرات ({sym})...")
+            status_update(chat_id, sid, f"⏳ جاري حساب المستويات الفنية ({sym})...")
             lv = compute_levels(daily, now_price)
             L += ["", build_plan(lv, now_price), "",
                   build_action(daily, now_price, estimate_cvd(daily), detect_structure(daily),
                                find_fvg(daily), find_gaps(daily), volume_spikes(daily))]
         else:
             L += ["", "🎯 خطة التداول: غير متاحة (لا توجد شموع كافية)."]
-        L += ["", "🩳 Short Interest (المصدر: NASDAQ)"]
-        
-        status_update(chat_id, sid, f"⏳ جاري جلب Short Interest وإفصاحات SEC ({sym})...")
-        try:
-            rows = fetch_nasdaq_short(sym)
-        except Exception as e:
-            rows = []
-            notes.append(f"NASDAQ: {short_err(e)}")
-        L.append(short_interest_section(rows, to_num((tv or {}).get("float_shares_outstanding"))))
 
-        dil_text, insider_text, cik = None, None, None
-        try:
-            cik = sec_cik(sym)
-            if cik:
-                filings = sec_recent(cik)
-                docs = []
-                for f in pick_dilution_filings(filings):
-                    try:
-                        docs.append(f"=== {f['form']} بتاريخ {f['date']} ===\n"
-                                    + relevant_excerpts(sec_text(sec_url(cik, f))))
-                    except Exception as e:
-                        notes.append(f"SEC {f['form']}: {short_err(e)}")
-                if docs:
-                    status_update(chat_id, sid, f"⏳ جاري تحليل الوارنتس والتخفيف ({sym})...")
-                    dil_text = gemini(DIL_SYSTEM, [{"text": "\n\n".join(docs)[:200000]}], 4000)
-                insider_text = insider_section(cik, filings)
-            else:
-                notes.append("SEC: الرمز غير موجود في قائمة الشركات")
-        except Exception as e:
-            if isinstance(e, QuotaError):
-                raise
-            notes.append(f"SEC: {short_err(e)}")
-        L += ["", "📑 الوارنتس والإصدارات والتخفيف (من إفصاحات SEC)",
-              dil_text or "غير متاح (لم تتوفر إفصاحات كافية)."]
-        L += ["", "👔 رادار صفقات المطلعين (Form 4)", insider_text or "غير متاح."]
+        # معالجة Short Interest و SEC للإفصاحات (مخصصة للأسهم الأمريكية وتُتجاوز للسعودي)
+        if not is_saudi:
+            L += ["", "🩳 Short Interest (المصدر: NASDAQ)"]
+            status_update(chat_id, sid, f"⏳ جاري جلب بيانات Short Interest وإفصاحات SEC ({sym})...")
+            try:
+                rows = fetch_nasdaq_short(sym)
+            except Exception as e:
+                rows = []
+                notes.append(f"NASDAQ: {short_err(e)}")
+            L.append(short_interest_section(rows, to_num((tv or {}).get("float_shares_outstanding"))))
+
+            dil_text, insider_text = None, None
+            try:
+                cik = sec_cik(sym)
+                if cik:
+                    filings = sec_recent(cik)
+                    docs = []
+                    for f in pick_dilution_filings(filings):
+                        try:
+                            docs.append(f"=== {f['form']} بتاريخ {f['date']} ===\n"
+                                        + relevant_excerpts(sec_text(sec_url(cik, f))))
+                        except Exception as e:
+                            notes.append(f"SEC {f['form']}: {short_err(e)}")
+                    if docs:
+                        status_update(chat_id, sid, f"⏳ جاري تحليل الوارنتس والتخفيف ({sym})...")
+                        dil_text = gemini(DIL_SYSTEM, [{"text": "\n\n".join(docs)[:200000]}], 4000)
+                    insider_text = insider_section(cik, filings)
+                else:
+                    notes.append("SEC: الرمز غير مدرج في نظام الإفصاح الأمريكي")
+            except Exception as e:
+                if isinstance(e, QuotaError):
+                    raise
+                notes.append(f"SEC: {short_err(e)}")
+            L += ["", "📑 الوارنتس والإصدارات والتخفيف (من إفصاحات SEC)",
+                  dil_text or "غير متاح (لأنها خاصة بالشركات الأمريكية المدرجة)."]
+            L += ["", "👔 رادار صفقات المطلعين (Form 4)", insider_text or "غير متاح."]
+        else:
+            L += ["", "ℹ️ بيانات Short Interest وإفصاحات SEC و Form 4 مخصصة للأسهم الأمريكية فقط وتم تجاوزها للسهم السعودي."]
 
         status_update(chat_id, sid, f"⏳ جاري البحث عن الأخبار والمحفزات ({sym})...")
         try:
-            L += ["", "📰 الأخبار والمحفزات ونبذة عن الشركة (بحث Google)", news_section(sym, name)]
+            L += ["", "📰 الأخبار والمحفزات ونبذة عن الشركة (بحث Google)", news_section(sym, name, is_saudi=is_saudi)]
         except QuotaError:
             raise
         except Exception as e:
@@ -1484,7 +1488,7 @@ def handle(msg):
                     if sy:
                         analyze_stock(chat_id, mid, e, sy)
                     else:
-                        send(chat_id, "⚠️ هذا الرابط لا يحتوي على رمز السهم. أرسل: تحليل UPLD", mid)
+                        send(chat_id, "⚠️ هذا الرابط لا يحتوي على رمز السهم. أرسل: تحليل UPLD أو تحليل 4263", mid)
                 elif want_download and (is_video_site(url) or YT_RE.search(url)):
                     process_video_download(chat_id, mid, url)
                 elif YT_RE.search(url):
