@@ -27,7 +27,7 @@ AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
     "GEMINI_FALLBACK_MODELS", "gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -337,9 +337,8 @@ class QuotaError(Exception):
 
 
 QUOTA_MSG = (
-    "⚠️ تم استهلاك حد الاستخدام المجاني للنموذج مؤقتاً.\n\n"
-    "• الحد اليومي يتجدد تلقائياً، فأعد المحاولة بعد قليل.\n"
-    "• يمكنك التحويل إلى النموذج الآخر عبر إعدادات البيئة."
+    "⚠️ تم استهلاك حد الاستخدام المجاني للنماذج مؤقتاً (تم تجربة النماذج الأساسية والاحتياطية).\n\n"
+    "• الحد اليومي يتجدد تلقائياً، فأعد المحاولة بعد قليل."
 )
 
 
@@ -400,30 +399,56 @@ def call_gemini(system, parts, max_tokens=2000, timeout=300, tools=None):
     if tools:
         body["tools"] = tools
     headers = {"x-goog-api-key": GEMINI_API_KEY}
-    models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    
+    # دمج النموذج الأساسي مع النماذج الاحتياطية وإزالة التكرار لضمان الانتقال التلقائي السلس
+    all_models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    
     last_status, last_msg, data = None, "Gemini error", {}
-    for idx, model in enumerate(models):
-        is_last = idx == len(models) - 1
-        attempts = 3 if is_last else 1
+    
+    for model_idx, model in enumerate(all_models):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        attempts = 2
+        model_failed = False
+        
         for attempt in range(attempts):
-            r = requests.post(url, json=body, headers=headers, timeout=timeout)
             try:
-                data = r.json()
-            except Exception:
-                data = {}
-            if r.status_code == 200:
-                return _parse_gemini(data)
-            last_status = r.status_code
-            last_msg = data.get("error", {}).get("message", "Gemini error")
-            if r.status_code in (429, 500, 503):
+                r = requests.post(url, json=body, headers=headers, timeout=timeout)
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+                
+                if r.status_code == 200:
+                    return _parse_gemini(data)
+                
+                last_status = r.status_code
+                last_msg = data.get("error", {}).get("message", "Gemini error")
+                
+                # إذا ظهر خطأ استهلاك الحد (429) أو خطأ في الخادم، نحاول إعادة المحاولة أو الانتقال للنموذج التالي
+                if r.status_code in (429, 500, 503):
+                    if attempt < attempts - 1:
+                        time.sleep(3)
+                        continue
+                    model_failed = True
+                    break
+                elif r.status_code == 404:
+                    # النموذج غير متاح أو خطأ في الاسم، ننتقل مباشرة للنموذج الاحتياطي التالي
+                    model_failed = True
+                    break
+                else:
+                    raise Exception(last_msg)
+            except requests.exceptions.RequestException as req_err:
+                last_msg = str(req_err)
                 if attempt < attempts - 1:
-                    time.sleep(15 * (attempt + 1))
                     continue
+                model_failed = True
                 break
-            if r.status_code == 404 and idx > 0:
-                break
-            raise Exception(last_msg)
+                
+        if model_failed:
+            # إذا فشل النموذج الحالي، يتم الانتقال تلقائياً للنموذج التالي في الحلقة التكرارية
+            print(f"Model {model} failed (Status: {last_status}), switching to next fallback model...")
+            continue
+
     if last_status == 429:
         raise QuotaError(last_msg)
     raise Exception(last_msg)
