@@ -1,126 +1,62 @@
-import glob
-import io
-import mimetypes
 import os
-import re
-import subprocess
-import sys
-import tempfile
 import time
-import traceback
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
-from html.parser import HTMLParser
-from urllib.parse import urlparse, parse_qs, unquote
-
 import requests
-from pypdf import PdfReader
-from docx import Document
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = str(os.environ["CHAT_ID"])
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = str(os.environ.get("CHAT_ID", ""))
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://localhost:5000/ask") # رابط الجسر المحلي الخاص بك
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-# إعدادات النماذج
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-FALLBACK_MODELS = [m.strip() for m in os.environ.get(
-    "GEMINI_FALLBACK_MODELS", "gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20400"))
-SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
-URL_RE = re.compile(r"https?://\S+")
-
-LAST = {"title": None, "text": None, "kind": "doc"}
-STATE = {"mode": None, "hist": []}
-
-HELP = (
-    "👋 أهلاً بك!\n\n"
-    "📝 أرسل أي نص أو تحليل أو رابط شارت ← سأقوم بمعالجته عبر الـ API فوراً وبدون مشاكل متصفح.\n"
-    "/start - المساعدة\n"
-    "/new - إعادة ضبط الحالة\n"
-)
-
-
-def tg(method, **params):
+def send_message(chat_id, text, reply_to=None):
     try:
-        r = requests.post(f"{API}/{method}", json=params, timeout=60)
-        return r.json()
+        requests.post(f"{API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "reply_to_message_id": reply_to
+        }, timeout=30)
     except Exception as e:
-        print("tg error:", method, e)
-        return {}
+        print("Telegram send error:", e)
 
-
-def send(chat_id, text, reply_to=None):
-    if len(text) > 4000:
-        text = text[:3900] + "\n\n...(تم اختصار الرد لطوله)"
-    tg("sendMessage", chat_id=chat_id, text=text, reply_to_message_id=reply_to)
-
-
-def call_gemini(system, text):
-    headers = {"x-goog-api-key": GEMINI_API_KEY}
-    body = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": text}]}],
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+def process_via_bridge(prompt_text):
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=60)
+        r = requests.post(BRIDGE_URL, json={"prompt": prompt_text}, timeout=60)
         res = r.json()
-        cands = res.get("candidates", [])
-        if cands:
-            parts = cands[0].get("content", {}).get("parts", [])
-            return "".join(p.get("text", "") for p in parts).replace("**", "").strip()
+        if res.get("status") == "success":
+            return res.get("result", "⚠️ تم التوليد بنجاح ولكن النص فارغ.")
+        else:
+            return f"❌ خطأ من الجسر: {res.get('message')}"
     except Exception as e:
-        print("Gemini API error:", e)
-    return "⚠️ تعذر المعالجة عبر النموذج حالياً."
-
-
-def handle(msg):
-    chat_id = msg["chat"]["id"]
-    if str(chat_id) != CHAT_ID:
-        return
-    mid = msg["message_id"]
-    text = msg.get("text")
-
-    try:
-        if text:
-            if text.startswith("/start"):
-                send(chat_id, HELP, mid)
-            elif text.startswith("/new"):
-                send(chat_id, "✅ تم إعادة ضبط الحالة.", mid)
-            else:
-                send(chat_id, "⏳ جاري المعالجة الفورية...", mid)
-                system_prompt = "أنت مساعد مالي وفني محترف للأسواق. أجب بدقة واحترافية باللغة العربية."
-                result = call_gemini(system_prompt, text)
-                send(chat_id, result, mid)
-    except Exception as e:
-        print(traceback.format_exc())
-        send(chat_id, f"❌ حدث خطأ: {str(e)[:200]}", mid)
-
+        return f"❌ تعذر الاتصال بالجسر المحلي: {str(e)}"
 
 def main():
-    end = time.time() + RUN_SECONDS
+    print("🤖 البوت يعمل ويراقب الرسائل عبر الجسر...")
     offset = None
-    print("🤖 البوت يعمل الآن بنجاح عبر الـ API المباشر...")
-    while time.time() < end:
-        params = {"timeout": 20}
-        if offset:
-            params["offset"] = offset
-        res = tg("getUpdates", **params)
-        if not res.get("ok", True) or "result" not in res:
+    start_time = time.time()
+    
+    while time.time() - start_time < 1800:
+        try:
+            params = {"timeout": 10}
+            if offset:
+                params["offset"] = offset
+                
+            res = requests.get(f"{API}/getUpdates", params=params, timeout=20).json()
+            if res.get("ok") and "result" in res:
+                for upd in res["result"]:
+                    offset = upd["update_id"] + 1
+                    msg = upd.get("message")
+                    
+                    if msg and str(msg.get("chat", {}).get("id")) == CHAT_ID:
+                        text = msg.get("text")
+                        mid = msg.get("message_id")
+                        
+                        if text:
+                            print(f"📥 تم استلام: {text}")
+                            send_message(CHAT_ID, "⏳ جاري المعالجة عبر المتصفح بدون قيود...", mid)
+                            answer = process_via_bridge(text)
+                            send_message(CHAT_ID, answer, mid)
+        except Exception as e:
+            print("Loop error:", e)
             time.sleep(5)
-            continue
-        for upd in res["result"]:
-            offset = upd["update_id"] + 1
-            if "message" in upd:
-                handle(upd["message"])
-
 
 if __name__ == "__main__":
     main()
