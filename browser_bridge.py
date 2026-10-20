@@ -8,22 +8,25 @@ import undetected_chromedriver as uc
 
 app = Flask(__name__)
 
-# تهيئة المتصفح الحقيقي لتجاوز القيود
 print("⏳ جاري فتح المتصفح والاتصال بـ Google AI Studio...")
 options = uc.ChromeOptions()
 options.add_argument('--no-sandbox')
 options.add_argument('--disable-dev-shm-usage')
+
+# فتح المتصفح
 driver = uc.Chrome(options=options)
 driver.get("https://aistudio.google.com/")
-print("✅ المتصفح جاهز! يرجى التأكد من تسجيل الدخول بحسابك في صفحة المتصفح المفتوحة.")
+print("✅ تم فتح المتصفح! يرجى التأكد من تسجيل الدخول بحساب Google الخاص بك في الصفحة المفتوحة.")
 
-@app.route('/enqueue', methods=['POST'])
-def enqueue():
-    data = request.json
-    prompt = data.get("prompt")
+@app.route('/ask', methods=['POST'])
+def ask():
+    data = request.json or {}
+    prompt = data.get("prompt", "")
     
+    if not prompt:
+        return jsonify({"status": "error", "message": "النص فارغ"}), 400
+
     try:
-        # البحث عن صندوق الإدخال في Google AI Studio
         wait = WebDriverWait(driver, 20)
         input_box = wait.until(EC.presence_of_element_located((By.TAG_NAME, "textarea")))
         input_box.clear()
@@ -31,20 +34,18 @@ def enqueue():
         time.sleep(1)
         input_box.send_keys(Keys.ENTER)
         
-        # الانتظار حتى يتم توليد الإجابة
+        print("⏳ جاري انتظار التوليد في المتصفح...")
         time.sleep(10)
         
-        # جلب أحدث رد من الصفحة
         responses = driver.find_elements(By.CSS_SELECTOR, ".model-response-text, .response-container, ms-chat-turn")
         if responses:
-            answer = responses[-1].text
-            return jsonify({"status": "success", "result": answer})
+            return jsonify({"status": "success", "result": responses[-1].text})
         else:
-            return jsonify({"status": "error", "message": "لم يتم العثور على رد في المتصفح"})
-            
+            return jsonify({"status": "error", "message": "تعذر قراءة الرد من الصفحة"})
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+        print("خطأ في المتصفح:", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    # تشغيل خادم محلي يستقبل الطلبات
+    # يعمل على المنفذ 5000 ويستقبل الطلبات
     app.run(host='0.0.0.0', port=5000)
