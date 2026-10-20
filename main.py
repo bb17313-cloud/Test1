@@ -7,21 +7,24 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import undetected_chromedriver as uc  # متصفح آمن لتجاوز الحظر والإغلاق
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
-CHAT_ID = str(os.environ.get("CHAT_ID", "ضع_معرف_الشات_هنا"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = str(os.environ.get("CHAT_ID", ""))
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# 1. إعداد المتصفح وتجاوز أنظمة الكشف عن البوتات
+# 1. إعداد المتصفح بوضع الخفاء المناسب لسيرفرات السحابة (GitHub Actions)
 def init_browser():
     options = uc.ChromeOptions()
-    # options.add_argument('--headless') # يمكنك تفعيلها لإخفاء المتصفح بعد التأكد من تشغيله
+    # مفعل إجباري لكي يعمل على سرفرات لينكس السحابية بدون شاشة
+    options.add_argument('--headless=new')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
     
-    print("⏳ جاري فتح المتصفح للربط مع Google AI Studio...")
+    print("⏳ جاري تهيئة المتصفح المخفي للعمل على السحابة...")
     driver = uc.Chrome(options=options)
     driver.get("https://aistudio.google.com/")
-    print("✅ تم فتح المتصفح بنجاح! يرجى تسجيل الدخول يدوياً في المتصفح إذا كانت المرة الأولى.")
+    print("✅ تم تحميل الصفحة بنجاح في السحابة!")
     return driver
 
 # 2. إرسال الطلب للمتصفح وسحب الإجابة
