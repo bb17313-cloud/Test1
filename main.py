@@ -1,106 +1,126 @@
+import glob
+import io
+import mimetypes
 import os
+import re
+import subprocess
+import sys
+import tempfile
 import time
+import traceback
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
+from urllib.parse import urlparse, parse_qs, unquote
+
 import requests
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import undetected_chromedriver as uc  # متصفح آمن لتجاوز الحظر والإغلاق
+from pypdf import PdfReader
+from docx import Document
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID = str(os.environ.get("CHAT_ID", ""))
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = str(os.environ["CHAT_ID"])
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
-# 1. إعداد المتصفح بوضع الخفاء المناسب لسيرفرات السحابة (GitHub Actions)
-def init_browser():
-    options = uc.ChromeOptions()
-    # مفعل إجباري لكي يعمل على سرفرات لينكس السحابية بدون شاشة
-    options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    
-    print("⏳ جاري تهيئة المتصفح المخفي للعمل على السحابة...")
-    driver = uc.Chrome(options=options)
-    driver.get("https://aistudio.google.com/")
-    print("✅ تم تحميل الصفحة بنجاح في السحابة!")
-    return driver
+# إعدادات النماذج
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# 2. إرسال الطلب للمتصفح وسحب الإجابة
-def ask_gemini_via_browser(driver, prompt_text):
-    try:
-        wait = WebDriverWait(driver, 20)
-        
-        # البحث عن صندوق إدخال النص في الصفحة
-        input_box = wait.until(EC.presence_of_element_located((By.TAG_NAME, "textarea")))
-        input_box.clear()
-        
-        # كتابة الطلب وإرساله
-        input_box.send_keys(prompt_text)
-        time.sleep(1)
-        input_box.send_keys(Keys.ENTER)
-        
-        print("⏳ جاري الانتظار حتى يكتمل التوليد داخل المتصفح...")
-        time.sleep(8)  # مهلة زمنية لتوليد الإجابة
-        
-        # جلب آخر إجابة من النموذج
-        responses = driver.find_elements(By.CSS_SELECTOR, ".model-response-text, .response-container, ms-chat-turn")
-        if responses:
-            return responses[-1].text
-        else:
-            return "⚠️ تعذر قراءة النتيجة من المتصفح."
-            
-    except Exception as e:
-        print("خطأ أثناء معالجة المتصفح:", e)
-        return "❌ حدث خطأ أثناء الاتصال بالمتصفح."
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+FALLBACK_MODELS = [m.strip() for m in os.environ.get(
+    "GEMINI_FALLBACK_MODELS", "gemini-flash-lite-latest,gemini-3.5-flash-lite").split(",") if m.strip()]
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# 3. التواصل مع تيليغرام
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "20400"))
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT", "TranslatorBot contact@example.com")
+URL_RE = re.compile(r"https?://\S+")
+
+LAST = {"title": None, "text": None, "kind": "doc"}
+STATE = {"mode": None, "hist": []}
+
+HELP = (
+    "👋 أهلاً بك!\n\n"
+    "📝 أرسل أي نص أو تحليل أو رابط شارت ← سأقوم بمعالجته عبر الـ API فوراً وبدون مشاكل متصفح.\n"
+    "/start - المساعدة\n"
+    "/new - إعادة ضبط الحالة\n"
+)
+
+
 def tg(method, **params):
     try:
         r = requests.post(f"{API}/{method}", json=params, timeout=60)
         return r.json()
     except Exception as e:
-        print("tg error:", e)
+        print("tg error:", method, e)
         return {}
 
-def send_message(chat_id, text, reply_to=None):
+
+def send(chat_id, text, reply_to=None):
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n...(تم اختصار الرد لطوله)"
     tg("sendMessage", chat_id=chat_id, text=text, reply_to_message_id=reply_to)
 
-# 4. الحلقة الرئيسية لاستقبال رسائل تيليغرام
+
+def call_gemini(system, text):
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    body = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+    try:
+        r = requests.post(url, json=body, headers=headers, timeout=60)
+        res = r.json()
+        cands = res.get("candidates", [])
+        if cands:
+            parts = cands[0].get("content", {}).get("parts", [])
+            return "".join(p.get("text", "") for p in parts).replace("**", "").strip()
+    except Exception as e:
+        print("Gemini API error:", e)
+    return "⚠️ تعذر المعالجة عبر النموذج حالياً."
+
+
+def handle(msg):
+    chat_id = msg["chat"]["id"]
+    if str(chat_id) != CHAT_ID:
+        return
+    mid = msg["message_id"]
+    text = msg.get("text")
+
+    try:
+        if text:
+            if text.startswith("/start"):
+                send(chat_id, HELP, mid)
+            elif text.startswith("/new"):
+                send(chat_id, "✅ تم إعادة ضبط الحالة.", mid)
+            else:
+                send(chat_id, "⏳ جاري المعالجة الفورية...", mid)
+                system_prompt = "أنت مساعد مالي وفني محترف للأسواق. أجب بدقة واحترافية باللغة العربية."
+                result = call_gemini(system_prompt, text)
+                send(chat_id, result, mid)
+    except Exception as e:
+        print(traceback.format_exc())
+        send(chat_id, f"❌ حدث خطأ: {str(e)[:200]}", mid)
+
+
 def main():
-    driver = init_browser()
+    end = time.time() + RUN_SECONDS
     offset = None
-    print("🤖 البوت يعمل الآن عبر المتصفح وجاهز لاستقبال الطلبات...")
-    
-    while True:
-        try:
-            params = {"timeout": 20}
-            if offset:
-                params["offset"] = offset
-            res = tg("getUpdates", **params)
-            
-            if res.get("ok") and "result" in res:
-                for upd in res["result"]:
-                    offset = upd["update_id"] + 1
-                    msg = upd.get("message")
-                    
-                    if msg and str(msg["chat"]["id"]) == CHAT_ID:
-                        text = msg.get("text")
-                        mid = msg["message_id"]
-                        
-                        if text:
-                            send_message(CHAT_ID, "⏳ جاري المعالجة عبر المتصفح (تجاوز القيود)...", mid)
-                            
-                            # صياغة الطلب للنموذج
-                            full_prompt = f"قم بمعالجة والرد على النص أو التحليل التالية بدقة وحسب الأصول الفنية:\n{text}"
-                            result = ask_gemini_via_browser(driver, full_prompt)
-                            
-                            send_message(CHAT_ID, result, mid)
-                            
-        except Exception as e:
-            print("خطأ في التشغيل الرئيسي:", e)
+    print("🤖 البوت يعمل الآن بنجاح عبر الـ API المباشر...")
+    while time.time() < end:
+        params = {"timeout": 20}
+        if offset:
+            params["offset"] = offset
+        res = tg("getUpdates", **params)
+        if not res.get("ok", True) or "result" not in res:
             time.sleep(5)
+            continue
+        for upd in res["result"]:
+            offset = upd["update_id"] + 1
+            if "message" in upd:
+                handle(upd["message"])
+
 
 if __name__ == "__main__":
     main()
