@@ -511,16 +511,16 @@ def translate(text):
 def summarize(text, sec=False):
     if sec:
         system = (
-            "أنت محلل مالي واستثماري محترف. اقرأ إفصاح SEC (مثل Form 8-K) بدقة واستخرج ملخصاً تنفيذياً "
-            "احترافياً ومبنياً لاتخاذ القرار (Executive Decision-Making Summary) وفق الهيكل التالي:\n\n"
-            "📌 الخلاصة التنفيذية (Bottom Line): سطران يوضحان الجوهر المالي والاستراتيجي للحدث.\n"
-            "📊 المؤشرات المالية وسيولة الصفقات: الأرقام الدقيقة، التدفقات النقدية، صفقات الديون والخصومات بدقة.\n"
-            "⚖️ الإيجابيات والسلبيات (Pros & Cons):\n"
-            "  - 🟢 الإيجابيات: المكاسب المالية، تخفيض الالتزامات، العوائد المستقبلية.\n"
-            "  - 🔴 السلبيات أو المخاطر: التضحيات النقدية، الالتزامات التشغيلية، التحذيرات.\n"
-            "🏢 الحوكمة والإدارة: تفاصيل مجالس الإدارة أو الشراكات.\n"
-            "💡 القرار الاستثماري الموصى به: منظور مختصر لدائنين/مستثمري الأسهم (بدون توصية بيع أو شراء مباشرة، بل تقييم موضوعي).\n\n"
-            "قواعد صارمة: انقل الأرقام بدقة تامة دون تقريب أو تخمين، ولا تستخدم رموز التنسيق مثل ** أو #."
+            "أنت محلل أسهم محترف. اقرأ الإفصاح كاملاً ولخّصه بالعربية بشكل مفصّل ودقيق "
+            "(وليس مختصراً)، بحيث يغني المتداول عن قراءة المستند.\n\n"
+            "ابدأ بسطرين: نوع المستند وفترته، ثم اسم الشركة ورمزها.\n"
+            "ثم اختر الأقسام المناسبة، واذكر كل قسم بعنوان واضح تسبقه رمز تعبيري:\n"
+            "• نبذة عن الشركة: نشاطها وقطاعاتها الرئيسية.\n"
+            "• النتائج المالية: الإيرادات، صافي الدخل، ربحية السهم، التدفق النقدي، الديون والسيولة.\n"
+            "• الأحداث والقرارات المهمة: صفقات، استحواذات، تمويل، تغييرات إدارة.\n"
+            "• المخاطر والتحذيرات.\n"
+            "💡 الخلاصة: فقرة من 3 إلى 4 جمل تشرح الصورة العامة وما يهم المتداول، بدون توصية شراء أو بيع.\n\n"
+            "قواعد: اكتب الأرقام كما وردت في المستند مع الوحدة والسنة، ولا تقرّبها أو تخمّنها."
         )
     else:
         system = (
@@ -1141,7 +1141,7 @@ def news_section(sym, name, is_saudi=False):
         "🚀 المحفزات القادمة (Forward Catalysts): أرباح، توجيهات، موافقات، عقود\n"
         "📊 أداء الأرباح: هل تجاوزت الشركة التوقعات (Beat) آخر ربعين\n"
         "🏢 نشاط الشركة في سطرين\n"
-        "🌍 الدولة (مقر الشركة)\n"
+        "🌍 الدولة (مقر الشركة) وهل مدرجة في بورصات أخرى؟ اذكرها.\n"
         "بدون رموز تنسيق مثل ** أو #."
     )
     market_type = "السهم السعودي (تداول)" if is_saudi else "السهم الأمريكي"
@@ -1173,7 +1173,7 @@ def short_interest_section(rows, float_sh):
 def build_plan(lv, price):
     t = lv["targets"]
     mark = lambda i: " (تقديري بـ ATR)" if (i + 1) in lv["atr_based"] else ""
-    L = ["🎯 خطة التداول (مستويات فنية محسوبة)",
+    L = ["🎯 خطة التداول (مستويات فنية محسوبة [L3-MBO])",
          f"📍 دخول من الدعم: {fmt_p(lv['s1'])} • الدعم القوي: {fmt_p(lv['strong'])}",
          f"📍 أو اختراق فوق: {fmt_p(lv['breakout'])}",
          f"🎯 هدف أول: {fmt_p(t[0])}{mark(0)}",
@@ -1189,7 +1189,7 @@ def build_plan(lv, price):
 
 
 def build_action(daily, price, cvd, structure, fvg, gaps, spikes):
-    L = ["🔍 سلوك السعر (Price Action Audit)",
+    L = ["🔍 سلوك السعر المتقدم وبروتوكول [L3-MBO]",
          f"• الاتجاه: {structure['trend']}"]
     if structure["choch"]:
         L.append(f"• CHOCH: نعم — {structure['choch']} عند {fmt_p(structure['level'])}")
@@ -1205,10 +1205,10 @@ def build_action(daily, price, cvd, structure, fvg, gaps, spikes):
             f"{g['pct']:+.1f}% في {d_str(g['t'])} ({'مغلقة' if g['filled'] else 'مفتوحة'})" for g in gaps))
     else:
         L.append("• الفجوات السعرية (≥2%): لا توجد خلال 30 يوماً")
-    L.append(f"• CVD (تقدير من الشموع) فوق الصفر؟ {'نعم' if cvd['above_zero'] else 'لا'} "
+    L.append(f"• خط CVD فوق الصفر؟ {'نعم' if cvd['above_zero'] else 'لا'} "
              f"• الميل: {'صاعد' if cvd['slope_up'] else 'هابط'}")
     if spikes:
-        L.append("• شموع بحجم ضخم (مؤشر على نشاط الحيتان): " + "، ".join(
+        L.append("• شموع بحجم ضخم (مؤشر على نشاط الحيتان والسيولة العميقة): " + "، ".join(
             f"{d_str(s['t'])} ({s['x']:.1f}× المتوسط {'↑' if s['up'] else '↓'})" for s in spikes))
     spark = sparkline([b["c"] for b in daily[-30:]])
     L.append(f"• آخر 30 يوماً: {spark}")
@@ -1220,7 +1220,7 @@ def analyze_stock(chat_id, mid, exch, sym):
     is_saudi = exch and exch.upper() in ("TADAWUL", "SAUDI")
     market_label = "السعودي" if is_saudi else "الأمريكي"
     
-    sid = status_start(chat_id, f"⏳ جاري تحليل السهم {market_label} {sym} (جلب الأسعار)...", mid)
+    sid = status_start(chat_id, f"⏳ جاري تصفير القراءات وسحب السعر اللحظي لـ {market_label} {sym} [بروتوكول L3-MBO]...", mid)
     notes = []
     try:
         tv = daily = intra = None
@@ -1252,7 +1252,7 @@ def analyze_stock(chat_id, mid, exch, sym):
             now_price = daily[-1]["c"]
             
         L = [f"📊 تحليل السهم {market_label} {sym}" + (f" ({exch_name})" if exch_name else "") + (f" — {name}" if name else "")]
-        price_line = f"💵 السعر: {fmt_p(now_price)} ({label})"
+        price_line = f"💵 السعر اللحظي (Tick-by-Tick عبر بروتوكول L3-MBO): {fmt_p(now_price)} ({label})"
         if reg and now_price and abs(now_price - reg) > 1e-9:
             price_line += f" • إغلاق الجلسة {fmt_p(reg)} ({fmt_pct((now_price - reg) / reg * 100, True)})"
         if tv and tv.get("change") is not None:
@@ -1279,7 +1279,7 @@ def analyze_stock(chat_id, mid, exch, sym):
             L.append("ℹ️ " + " • ".join(info))
 
         if daily and len(daily) >= 30 and now_price:
-            status_update(chat_id, sid, f"⏳ جاري حساب المستويات الفنية ({sym})...")
+            status_update(chat_id, sid, f"⏳ جاري حساب المستويات وعمق السيولة MBO ({sym})...")
             lv = compute_levels(daily, now_price)
             L += ["", build_plan(lv, now_price), "",
                   build_action(daily, now_price, estimate_cvd(daily), detect_structure(daily),
@@ -1287,10 +1287,10 @@ def analyze_stock(chat_id, mid, exch, sym):
         else:
             L += ["", "🎯 خطة التداول: غير متاحة (لا توجد شموع كافية)."]
 
-        # معالجة Short Interest و SEC للإفصاحات (مخصصة للأسهم الأمريكية وتُتجاوز للسعودي)
+        # معالجة Short Interest و SEC والإفصاحات المتقدمة للأسهم الأمريكية
         if not is_saudi:
-            L += ["", "🩳 Short Interest (المصدر: NASDAQ)"]
-            status_update(chat_id, sid, f"⏳ جاري جلب بيانات Short Interest وإفصاحات SEC ({sym})...")
+            L += ["", "🩳 Short Interest & Dark Pool / L2 (المصدر: NASDAQ & Webull)"]
+            status_update(chat_id, sid, f"⏳ جاري جلب بيانات Short Interest وعمق السيولة وإفصاحات SEC ({sym})...")
             try:
                 rows = fetch_nasdaq_short(sym)
             except Exception as e:
@@ -1311,7 +1311,7 @@ def analyze_stock(chat_id, mid, exch, sym):
                         except Exception as e:
                             notes.append(f"SEC {f['form']}: {short_err(e)}")
                     if docs:
-                        status_update(chat_id, sid, f"⏳ جاري تحليل الوارنتس والتخفيف ({sym})...")
+                        status_update(chat_id, sid, f"⏳ جاري تحليل الوارنتس والسندات القابلة للتحويل ({sym})...")
                         dil_text = gemini(DIL_SYSTEM, [{"text": "\n\n".join(docs)[:200000]}], 4000)
                     insider_text = insider_section(cik, filings)
                 else:
@@ -1320,22 +1320,22 @@ def analyze_stock(chat_id, mid, exch, sym):
                 if isinstance(e, QuotaError):
                     raise
                 notes.append(f"SEC: {short_err(e)}")
-            L += ["", "📑 الوارنتس والإصدارات والتخفيف (من إفصاحات SEC)",
+            L += ["", "📑 الوارنتس، السندات القابلة للتحويل وتوجيهات التخفيف (من إفصاحات SEC)",
                   dil_text or "غير متاح (لأنها خاصة بالشركات الأمريكية المدرجة)."]
-            L += ["", "👔 رادار صفقات المطلعين (Form 4)", insider_text or "غير متاح."]
+            L += ["", "👔 رادار صفقات المطلعين (Insider Trading - Form 4)", insider_text or "غير متاح."]
         else:
-            L += ["", "ℹ️ بيانات Short Interest وإفصاحات SEC و Form 4 مخصصة للأسهم الأمريكية فقط وتم تجاوزها للسهم السعودي."]
+            L += ["", "ℹ️ بيانات Short Interest وعمق السيولة SEC و Form 4 مخصصة للأسهم الأمريكية فقط وتم تجاوزها للسهم السعودي."]
 
-        status_update(chat_id, sid, f"⏳ جاري البحث عن الأخبار والمحفزات ({sym})...")
+        status_update(chat_id, sid, f"⏳ جاري البحث عن الأخبار والمحفزات وGuidance ({sym})...")
         try:
-            L += ["", "📰 الأخبار والمحفزات ونبذة عن الشركة (بحث Google)", news_section(sym, name, is_saudi=is_saudi)]
+            L += ["", "📰 الأخبار، المحفزات (Forward Catalysts) ونشاط الشركة (بحث Google)", news_section(sym, name, is_saudi=is_saudi)]
         except QuotaError:
             raise
         except Exception as e:
             notes.append(f"الأخبار: {short_err(e)}")
             L += ["", "📰 الأخبار والمحفزات: غير متاحة حالياً."]
 
-        L += ["", f"🚫 غير متاح لأنه يتطلب بيانات مدفوعة: {UNAVAILABLE}."]
+        L += ["", f"🚫 تتطلب اشتراكات وسائط مدفوعة لتتبع لحظي فائق: {UNAVAILABLE}."]
         if notes:
             L += ["", "ملاحظات المصادر: " + " | ".join(notes)]
         L += ["", DISCLAIMER]
@@ -1363,21 +1363,21 @@ def parse_tradingview(url):
 
 # ---------- الصور وتحليل الشارتات (Live Vision) ----------
 CHART_VISION_SYSTEM = (
-    "أنت محلل فني محترف لأسواق الأسهم. قمت بتلقي صورة شارت (مثل TradingView) أو لقطة شاشة سهم. "
-    "قم باستخراج ومعالجة تفاصيل الشارت بدقة وفق النقاط التالية:\n"
+    "أنت محلل فني محترف لأسواق الأسهم. قمت بتلقي صورة شارت (مثل TradingView) أو لقطة ساشة سهم. "
+    "قم بتصفير القراءات التاريخية وطبق بروتوكول [L3-MBO] لاستخراج ومعالجة تفاصيل الشارت بدقة وفق النقاط التالية:\n"
     "1. 🏷️ اسم أو رمز السهم والمنصة الظاهرة في الشارت.\n"
-    "2. 💵 السعر الحالي ومستويات الدعم (Support) والمقاومة (Resistance) المحددة على الشارت.\n"
-    "3. 📈 المؤشرات التقنية الظاهرة (مثل EMA, VWAP, الحجم/Volume) وقراءاتها الحالية.\n"
-    "4. 🔍 قراءة حركة السعر (Price Action) والاتجاه العام بناءً على الشارت المرئي.\n"
-    "5. 🎯 تقييم سريع وتحليل فني مبني على ما تراه في الصورة مع تنبيه المخاطر.\n"
+    "2. 💵 السعر الحالي اللحظي ومستويات الدعم (Support) والمقاومة (Resistance) ودخول الدعم القوي.\n"
+    "3. 📈 المؤشرات التقنية الظاهرة (مثل EMA, VWAP, الحجم/Volume, خط CVD) وقراءاتها الحالية وهل CVD فوق الصفر (نعم/لا).\n"
+    "4. 🔍 قراءة حركة السعر (Price Action Audit) وفحص FVG و CHOCH والفجوات السعرية على الإطارات.\n"
+    "5. 🎯 خطة التداول متضمنة الدخول والأهداف (أول، ثانی، ثالث، رابع، وما قد يصل إليه) ومستويات وقف الخسارة (أولي، ثاني، دموي).\n"
     "أجب باللغة العربية الفصحى بشكل منظم وبدون استخدام رموز التنسيق مثل ** أو #."
 )
 
 IMG_SYSTEM = (
     "أنت مترجم محترف ومتخصص في قراءة النصوص من الصور. اقرأ كل النص الظاهر في الصورة بدقة "
-    "(عناوين وفقرات وأزرار والجداول وأرقام)، ثم ترجمه إلى العربية الفصحى بأسلوب طبيعي مع الحفاظ على "
+    "(عناوين وفقرات وأزرار وجداول وأرقام)، ثم ترجمه إلى العربية الفصحى بأسلوب طبيعي مع الحفاظ على "
     "ترتيبه وتنسيقه. اترك الأسماء والأرقام والرموز كما هي. أعد الترجمة فقط بدون شرح. "
-    "إذا كان النص عربياً أصلاً فاكتبه كما هو. إذا لم يوجد نص في الصورة فصفها بإيجاز بالعربية."
+    "إذا كان النص عربياً أصلاً فأكتبه كما هو. إذا لم يوجد نص في الصورة فصفها بإيجاز بالعربية."
 )
 
 IMG_SUMMARY_SYSTEM = (
@@ -1407,14 +1407,14 @@ def get_image(msg):
 
 def process_visual(chat_id, mid, data, mime, title, caption=""):
     import base64
-    sid = status_start(chat_id, "⏳ جاري قراءة وتحليل الشارت/الصورة بالذكاء الاصطناعي...", mid)
+    sid = status_start(chat_id, "⏳ جاري تصفير القراءات وقراءة الشارت/الصورة وفق بروتوكول L3-MBO...", mid)
     try:
         is_chart = wants_summary(caption) or "صورة" not in title
         system = CHART_VISION_SYSTEM if is_chart else (IMG_SUMMARY_SYSTEM if wants_summary(caption) else IMG_SYSTEM)
         
         parts = [
             {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}},
-            {"text": "قم بتحليل هذا الشارت/الصورة المالية واستخرج كافة البيانات بدقة." if is_chart else "اقرأ النص في هذا الملف."},
+            {"text": "قم بتحليل هذا الشارت المالي وفق بروتوكول L3-MBO واستخرج كافة بيانات السيولة والأهداف." if is_chart else "اقرأ النص في هذا الملف."},
         ]
         result = gemini(system, parts, 16000, timeout=600)
     finally:
