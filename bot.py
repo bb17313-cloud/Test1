@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-بوت تلغرام: ترجمة / ملخص / تنزيل وتفريغ فيديو وصوت / تحليل أسهم / قراءة ملفات SEC
-المحرك: موقعا Gemini ثم Grok عبر المتصفح (Playwright) بدون API وبدون أي سر (دخول زائر).
+بوت تلغرام: ترجمة / ملخص / تنزيل وتفريغ فيديو وصوت / تحليل أسهم / قراءة ملفات SEC / بحث ويكيبيديا
+المحرك: مواقع Gemini و Grok و Wikipedia عبر المتصفح (Playwright) بدون API وبدون أي سر (دخول زائر).
 (GEMINI_STATE اختياري: إن وُجد يُستخدم حساب Gemini المسجّل لحدود أوسع).
 
 أوضاع التشغيل:
-  python bot.py          -> تشغيل البوت (على GitHub Actions)
-  python bot.py login    -> تسجيل دخول Gemini مرة واحدة على جهازك وتوليد الجلسة
+  python bot.py         -> تشغيل البوت (على GitHub Actions)
+  python bot.py login     -> تسجيل دخول Gemini مرة واحدة على جهازك وتوليد الجلسة
 
 المطلوب فقط: BOT_TOKEN, CHAT_ID (تلغرام) + SEC_USER_AGENT كنص عادي في bot.yml
 """
@@ -23,7 +23,7 @@ import tempfile
 import threading
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import requests
 
@@ -36,8 +36,9 @@ FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1800"))
 BRIDGE_TIMEOUT = int(os.environ.get("BRIDGE_TIMEOUT", "420"))
 SEC_UA = os.environ.get("SEC_USER_AGENT") or "StockBot admin@example.com"
-PROVIDERS = [x.strip() for x in (os.environ.get("PROVIDERS") or "gemini,grok").split(",") if x.strip()]
+PROVIDERS = [x.strip() for x in (os.environ.get("PROVIDERS") or "gemini,grok,wiki").split(",") if x.strip()]
 GROK_URL = "https://grok.com"
+WIKI_URL = "https://ar.wikipedia.org"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 STATE_FILE = "gemini_state.json"
 GEMINI_URL = "https://gemini.google.com/app"
@@ -51,7 +52,7 @@ SEC_CHUNK = 25000
 SEC_MAX_CHUNKS = 6
 
 # ============================================================
-# 1) جسر المتصفح (Gemini عبر Playwright) - يعمل داخل نفس الـ workflow
+# 1) جسر المتصفح (Gemini, Grok, Wikipedia عبر Playwright)
 # ============================================================
 
 
@@ -105,6 +106,8 @@ class GeminiBrowser:
         self.browser = None
         self.ctx = None
         self.page = None
+        self.gpage = None
+        self.wpage = None
 
     def start(self):
         from playwright.sync_api import sync_playwright
@@ -116,7 +119,6 @@ class GeminiBrowser:
             kw["storage_state"] = state
         self.ctx = self.browser.new_context(**kw)
         self.page = self.ctx.new_page()
-        self.gpage = None
 
     def _attach(self, path):
         pg = self.page
@@ -137,9 +139,41 @@ class GeminiBrowser:
                     return self._ask_gemini(prompt, image_path)
                 if prov == "grok":
                     return self._ask_grok(prompt, image_path)
+                if prov == "wiki":
+                    return self._ask_wiki(prompt)
             except Exception as e:
                 errors.append(f"{prov}: {str(e)[:120]}")
         raise RuntimeError(" | ".join(errors) or "لا يوجد مزوّد مفعّل")
+
+    def _ask_wiki(self, prompt, timeout=60):
+        """متصفح ويكيبيديا: يبحث في ويكيبيديا العربية ويستخرج الملخص من الصفحات."""
+        if self.wpage is None:
+            self.wpage = self.ctx.new_page()
+        pg = self.wpage
+        
+        # تنظيف الاستعلام أو استخدام محرك البحث الداخلي لويكيبيديا
+        search_url = f"{WIKI_URL}/w/index.php?search={quote_plus(prompt)}"
+        pg.goto(search_url, wait_until="domcontentloaded", timeout=timeout*1000)
+        pg.wait_for_timeout(2000)
+        
+        # إذا وجدنا مقالة مباشرة أو نتائج بحث
+        content_sel = "div.mw-parser-output p, div.searchresults"
+        try:
+            pg.locator(content_sel).first.wait_for(state="visible", timeout=10000)
+        except Exception:
+            pass
+            
+        # محاولة استخراج النصوص الأولى للمقالة أو نتائج البحث
+        paragraphs = pg.locator("div.mw-parser-output > p").all_inner_texts()
+        if not paragraphs:
+            paragraphs = pg.locator(".searchresult, .mw-search-result-heading").all_inner_texts()
+            
+        if paragraphs:
+            result_text = "\n".join([p.strip() for p in paragraphs[:5] if p.strip()])
+            if result_text:
+                return f"📖 **من ويكيبيديا:**\n\n{result_text[:3500]}"
+                
+        return "⚠️ لم أجد نتائج مطابقة في ويكيبيديا لهذا الطلب."
 
     def _ask_grok(self, prompt, image_path=None, timeout=360):
         if self.gpage is None:
@@ -348,8 +382,8 @@ def send_file(chat_id, path, kind="document", caption="", reply_to=None):
     try:
         with open(path, "rb") as f:
             requests.post(f"{API}/{ep[0]}", data={"chat_id": chat_id, "caption": caption[:900],
-                                                  "reply_to_message_id": reply_to or ""},
-                          files={ep[1]: f}, timeout=300)
+                                                 "reply_to_message_id": reply_to or ""},
+                        files={ep[1]: f}, timeout=300)
     except Exception as e:
         print("Telegram file error:", e)
 
@@ -748,15 +782,16 @@ def ticker_from_image(image_path):
 # ============================================================
 
 HELP = """🤖 الأوامر:
-• أي نص عادي ← ترجمة للعربية
-• /ملخص + نص (أو بالرد على رسالة) ← تلخيص
-• رابط فيديو (يوتيوب/X/تيك توك...) ← تنزيل الفيديو والصوت + تفريغ مترجم
-• /فيديو رابط | /صوت رابط | /تفريغ رابط ← خدمة واحدة فقط
-• صورة شارت ← تحليل السهم (الرمز في الكابشن اختياري)
-• $AAPL أو /سهم AAPL أو رابط سهم (TradingView/Finviz/Yahoo...) ← تحليل السهم
-• رابط sec.gov أو /sec AAPL ← قراءة وتحليل الإفصاحات
-• ملف PDF/TXT/HTML ← تلخيص (وإن كان إفصاح SEC يُحلَّل تلقائياً)
-• ملف صوت/فيديو ← تفريغ وترجمة"""
+- أي نص عادي ← ترجمة للعربية (أو بحث ويكيبيديا إذا تطلب الأمر)
+- /wiki أو /ويكي + موضوع ← البحث في ويكيبيديا
+- /ملخص + نص (أو بالرد على رسالة) ← تلخيص
+- رابط فيديو (يوتيوب/X/تيك توك...) ← تنزيل الفيديو والصوت + تفريغ مترجم
+- /فيديو رابط | /صوت رابط | /تفريغ رابط ← خدمة واحدة فقط
+- صورة شارت ← تحليل السهم (الرمز في الكابشن اختياري)
+- $AAPL أو /سهم AAPL أو رابط سهم (TradingView/Finviz/Yahoo...) ← تحليل السهم
+- رابط sec.gov أو /sec AAPL ← قراءة وتحليل الإفصاحات
+- ملف PDF/TXT/HTML ← تلخيص
+- ملف صوت/فيديو ← تفريغ وترجمة"""
 
 URL_RE = re.compile(r"https?://\S+")
 
@@ -784,6 +819,18 @@ def handle_text(chat_id, mid, text, reply_text=None):
 
     if cmd in ("/start", "/help", "/مساعدة"):
         send_message(chat_id, HELP, mid)
+        return
+
+    if cmd in ("/wiki", "/ويكي"):
+        if rest:
+            # توجيه الطلب خصيصاً لمتصفح ويكيبيديا عبر الجسر أو الدالة
+            if _BROWSER:
+                res = _BROWSER._ask_wiki(rest)
+                send_long(chat_id, res, mid)
+            else:
+                send_message(chat_id, "⚠️ متصفح ويكيبيديا غير جاهز بعد.", mid)
+        else:
+            send_message(chat_id, "⚠️ أضف الكلمة المراد البحث عنها بعد الأمر، مثال: `/wiki الذكاء الاصطناعي`", mid)
         return
 
     url_m = URL_RE.search(t)
@@ -814,175 +861,143 @@ def handle_text(chat_id, mid, text, reply_text=None):
         if url and not rest.replace(url, "").strip():
             src = fetch_url_text(url)
         if not src:
-            send_message(chat_id, "أرسل النص بعد الأمر أو استخدمه بالرد على رسالة.", mid)
+            send_message(chat_id, "⚠️ أرسل النص أو رد على رسالة لتلخيصها.", mid)
             return
         send_long(chat_id, summarize_text(src), mid)
         return
 
-    if cmd in ("/ترجم", "/tr"):
-        src = rest or reply_text or ""
-        send_long(chat_id, translate_to_arabic(src) if src else "أرسل النص بعد الأمر.", mid)
+    if url and is_media_url(url):
+        media_flow(chat_id, mid, url, "all")
         return
 
-    if url:
+    if url and ("sec.gov" in url or is_stock_url(url)):
         if "sec.gov" in url:
             send_long(chat_id, analyze_sec_text(fetch_url_text(url)), mid)
-        elif is_stock_url(url):
-            sym = ticker_from_url(url)
-            if not sym:
-                a = process_via_bridge("استخرج رمز السهم من هذا الرابط وأجب بالرمز فقط: " + url)
-                a = (a or "").strip().upper().strip("$")
-                sym = a if TICKER_RE.match(a) else None
-            send_long(chat_id, analyze_stock(sym), mid)
-        elif is_media_url(url):
-            media_flow(chat_id, mid, url, "all")
         else:
-            page = fetch_url_text(url)
-            send_long(chat_id, summarize_text(page), mid)
+            sym = ticker_from_url(url)
+            send_long(chat_id, analyze_stock(sym), mid)
         return
 
-    if re.fullmatch(r"\$[A-Za-z.\-]{1,6}", t) or re.fullmatch(r"[A-Z]{2,5}", t):
-        send_long(chat_id, analyze_stock(t.lstrip("$").upper()), mid)
+    if t.startswith("$") and TICKER_RE.match(t.upper().lstrip("$")):
+        send_long(chat_id, analyze_stock(t.upper().lstrip("$")), mid)
         return
 
+    # المعالجة الافتراضية للنص العادي
     if is_arabic(t):
-        send_message(chat_id, "النص عربي بالفعل. استخدم /ملخص للتلخيص.", mid)
-        return
-    send_long(chat_id, translate_to_arabic(t), mid)
+        send_long(chat_id, process_via_bridge(f"أجب عن التالي بدقة واحترافية:\n\n{t}"), mid)
+    else:
+        send_long(chat_id, translate_to_arabic(t), mid)
 
 
-def handle_document(chat_id, mid, msg):
-    doc = msg["document"]
-    name = doc.get("file_name", "file")
-    caption = (msg.get("caption") or "").strip()
-    mime = doc.get("mime_type", "")
+def handle_document(chat_id, mid, file_id, name, caption):
     wd = tempfile.mkdtemp(prefix="doc_")
     try:
-        if mime.startswith(("audio/", "video/")):
-            path = tg_download(doc["file_id"], wd, name)
-            if not path:
-                send_message(chat_id, "❌ الملف أكبر من 20MB؛ أرسله كرابط.", mid)
-                return
-            transcript_flow(chat_id, mid, path)
+        p = tg_download(file_id, wd, name)
+        if not p:
+            send_message(chat_id, "❌ تعذر تنزيل الملف.", mid)
             return
-        path = tg_download(doc["file_id"], wd, name)
-        if not path:
-            send_message(chat_id, "❌ تعذر تنزيل الملف (الحد 20MB).", mid)
+        ext = os.path.splitext(p)[1].lower()
+        if ext in (".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mkv"):
+            if ext in (".mp4", ".mkv"):
+                aud = os.path.join(wd, "extracted.mp3")
+                _run(["ffmpeg", "-i", p, "-q:a", "2", "-map", "a", aud])
+                if os.path.exists(aud):
+                    p = aud
+            transcript_flow(chat_id, mid, p)
             return
-        if name.lower().endswith(".pdf"):
-            text = pdf_to_text(path)
-        elif name.lower().endswith((".htm", ".html")):
-            text = html_to_text(open(path, encoding="utf-8", errors="ignore").read())
+        txt = ""
+        if ext == ".pdf":
+            txt = pdf_to_text(p)
+        elif ext in (".txt", ".html", ".htm", ".csv", ".json"):
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
         else:
-            text = open(path, encoding="utf-8", errors="ignore").read()
-        if not text.strip():
-            send_message(chat_id, "⚠️ لم أستطع استخراج نص من الملف.", mid)
-            return
-        looks_sec = "securities and exchange commission" in text[:5000].lower() or "sec" in name.lower()
-        if caption.startswith(("/ترجم", "/tr")):
-            send_long(chat_id, translate_to_arabic(text[:60000]), mid)
-        elif looks_sec:
-            send_long(chat_id, analyze_sec_text(text), mid)
+            txt = f"ملف مرفق: {name}"
+        if caption:
+            txt = f"ملاحظة المستخدم: {caption}\n\n" + txt
+        if "sec" in name.lower() or "10-k" in name.lower() or "10-q" in name.lower():
+            send_long(chat_id, analyze_sec_text(txt), mid)
         else:
-            send_long(chat_id, summarize_text(text), mid)
+            send_long(chat_id, summarize_text(txt), mid)
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
 
-def handle_photo(chat_id, mid, msg):
-    wd = tempfile.mkdtemp(prefix="img_")
+def handle_photo(chat_id, mid, photo_list, caption):
+    best = max(photo_list, key=lambda x: x.get("file_size", 0))
+    wd = tempfile.mkdtemp(prefix="photo_")
     try:
-        path = tg_download(msg["photo"][-1]["file_id"], wd, "chart.jpg")
-        if not path:
+        p = tg_download(best["file_id"], wd, "chart.jpg")
+        if not p:
             send_message(chat_id, "❌ تعذر تنزيل الصورة.", mid)
             return
-        cap = (msg.get("caption") or "").strip()
-        sym = None
-        for tok in re.findall(r"\$?[A-Za-z]{1,6}", cap):
-            s = tok.lstrip("$").upper()
-            if TICKER_RE.match(s) and (tok.startswith("$") or tok.isupper()):
-                sym = s
-                break
-        if not sym:
-            sym = ticker_from_image(path)
-        send_long(chat_id, analyze_stock(sym, path), mid)
+        sym = (caption or "").upper().lstrip("$").strip()
+        if not TICKER_RE.match(sym):
+            sym = ticker_from_image(p)
+        send_long(chat_id, analyze_stock(sym, p), mid)
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
 
-def handle_media_file(chat_id, mid, msg):
-    obj = msg.get("audio") or msg.get("voice") or msg.get("video") or msg.get("video_note")
-    wd = tempfile.mkdtemp(prefix="aud_")
-    try:
-        path = tg_download(obj["file_id"], wd)
-        if not path:
-            send_message(chat_id, "❌ الملف أكبر من 20MB؛ أرسله كرابط.", mid)
-            return
-        transcript_flow(chat_id, mid, path)
-    finally:
-        shutil.rmtree(wd, ignore_errors=True)
-
-
-def handle_message(msg):
-    mid = msg.get("message_id")
-    text = msg.get("text")
-    print(f"📥 تم استلام: {text or msg.get('caption') or '[ملف]'}")
-    send_message(CHAT_ID, "⏳ جاري المعالجة عبر المتصفح بدون قيود...", mid)
-    try:
-        if msg.get("photo"):
-            handle_photo(CHAT_ID, mid, msg)
-        elif msg.get("document"):
-            handle_document(CHAT_ID, mid, msg)
-        elif msg.get("audio") or msg.get("voice") or msg.get("video") or msg.get("video_note"):
-            handle_media_file(CHAT_ID, mid, msg)
-        elif text:
-            reply_text = (msg.get("reply_to_message") or {}).get("text")
-            handle_text(CHAT_ID, mid, text, reply_text)
-    except Exception as e:
-        print("Handler error:", e)
-        send_message(CHAT_ID, f"❌ خطأ أثناء المعالجة: {str(e)[:300]}", mid)
-
-
 # ============================================================
-# 8) الحلقة الرئيسية
+# 8) حلقة الاستطلاع (Polling) الرئيسية لتلغرام
 # ============================================================
+
+
+def telegram_polling():
+    offset = 0
+    print("🤖 البوت يعمل ويستطلع رسائل تلغرام...")
+    start_time = time.time()
+    while time.time() - start_time < RUN_SECONDS:
+        try:
+            r = requests.get(f"{API}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=45)
+            data = r.json()
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+                cid = str(msg.get("chat", {}).get("id", ""))
+                if CHAT_ID and cid != CHAT_ID:
+                    continue  # حماية: الرد فقط على الشات المخصص
+                mid = msg.get("message_id")
+                txt = msg.get("text") or msg.get("caption") or ""
+                reply_to = msg.get("reply_to_message", {})
+                reply_text = reply_to.get("text") or reply_to.get("caption")
+
+                if "photo" in msg:
+                    threading.Thread(target=handle_photo, args=(cid, mid, msg["photo"], txt), daemon=True).start()
+                elif "document" in msg:
+                    d = msg["document"]
+                    threading.Thread(target=handle_document, args=(cid, mid, d["file_id"], d.get("file_name", "file"), txt), daemon=True).start()
+                elif "audio" in msg or "voice" in msg:
+                    audio_obj = msg.get("audio") or msg.get("voice")
+                    threading.Thread(target=handle_document, args=(cid, mid, audio_obj["file_id"], audio_obj.get("file_name", "audio.ogg"), txt), daemon=True).start()
+                elif "video" in msg or "video_note" in msg:
+                    v_obj = msg.get("video") or msg.get("video_note")
+                    threading.Thread(target=handle_document, args=(cid, mid, v_obj["file_id"], v_obj.get("file_name", "video.mp4"), txt), daemon=True).start()
+                elif txt:
+                    threading.Thread(target=handle_text, args=(cid, mid, txt, reply_text), daemon=True).start()
+        except Exception as e:
+            print("Polling error:", e)
+            time.sleep(5)
 
 
 def main():
-    print("🤖 البوت يعمل ويراقب الرسائل عبر الجسر...")
+    if len(sys.argv) > 1 and sys.argv[1] == "login":
+        login_mode()
+        return
+    if not BOT_TOKEN:
+        print("خطأ: BOT_TOKEN غير موجود.")
+        sys.exit(1)
     if not start_bridge():
-        send_message(CHAT_ID, "❌ تعذر تشغيل المتصفح (Playwright). راجع سجل الـ workflow.")
-    offset = None
-    start_time = time.time()
-
-    while time.time() - start_time < RUN_SECONDS:
-        try:
-            params = {"timeout": 10}
-            if offset:
-                params["offset"] = offset
-
-            res = requests.get(f"{API}/getUpdates", params=params, timeout=20).json()
-            if res.get("ok") and "result" in res:
-                for upd in res["result"]:
-                    offset = upd["update_id"] + 1
-                    msg = upd.get("message")
-
-                    if msg and str(msg.get("chat", {}).get("id")) == CHAT_ID:
-                        handle_message(msg)
-        except Exception as e:
-            print("Loop error:", e)
-            time.sleep(5)
-
-    # تأكيد آخر تحديث حتى لا يُعاد في التشغيل التالي
-    if offset:
-        try:
-            requests.get(f"{API}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=20)
-        except Exception:
-            pass
+        print("خطأ في تشغيل جسر المتصفح.")
+        sys.exit(1)
+    telegram_polling()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "login":
-        login_mode()
-    else:
-        main()
+    main()
