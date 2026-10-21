@@ -39,8 +39,5 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # SEC تشترط اسماً وبريداً حقيقيين (نص عادي وليس سراً) - عدّله:
-          SEC_USER_AGENT: "StockBot your-email@example.com"
-          # اختياري فقط إن أردت حساب Gemini مسجّلاً:
-          # GEMINI_STATE: ${{ secrets.GEMINI_STATE }}
+          SEC_USER_AGENT: "stockxxx90@gmail.com"
           RUN_SECONDS: "1700"
