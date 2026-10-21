@@ -179,8 +179,17 @@ class GeminiBrowser:
         if self.gpage is None:
             self.gpage = self.ctx.new_page()
         pg = self.gpage
-        pg.goto(GROK_URL, wait_until="domcontentloaded", timeout=60000)
-        pg.wait_for_timeout(4000)
+        fresh = False
+        if pg.url.startswith(GROK_URL):
+            try:
+                pg.locator("a[href='/'], button[aria-label*='New chat' i]").first.click(timeout=3000)
+                pg.wait_for_timeout(500)
+                fresh = True
+            except Exception:
+                pass
+        if not fresh:
+            pg.goto(GROK_URL, wait_until="domcontentloaded", timeout=60000)
+            pg.wait_for_timeout(4000)
         if "just a moment" in (pg.title() or "").lower():
             pg.wait_for_timeout(10000)
             if "just a moment" in (pg.title() or "").lower():
@@ -202,7 +211,7 @@ class GeminiBrowser:
         deadline = time.time() + timeout
         last, stable = "", 0
         while time.time() < deadline:
-            pg.wait_for_timeout(2000)
+            pg.wait_for_timeout(1000)
             if pg.locator(sel).count() <= before:
                 continue
             txt = pg.locator(sel).last.inner_text().strip()
@@ -218,7 +227,16 @@ class GeminiBrowser:
 
     def _ask_gemini(self, prompt, image_path=None, timeout=360):
         pg = self.page
-        pg.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=60000)
+        fresh = False
+        if pg.url.startswith(GEMINI_URL):
+            try:
+                pg.locator("a[aria-label*='New chat' i], button[aria-label*='New chat' i]").first.click(timeout=3000)
+                pg.wait_for_timeout(500)
+                fresh = True
+            except Exception:
+                pass
+        if not fresh:
+            pg.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=60000)
         if "consent.google" in pg.url:
             try:
                 pg.locator("button:has-text('Reject all'), button:has-text('Accept all')").first.click(timeout=5000)
@@ -250,7 +268,7 @@ class GeminiBrowser:
         deadline = time.time() + timeout
         last, stable = "", 0
         while time.time() < deadline:
-            pg.wait_for_timeout(2000)
+            pg.wait_for_timeout(1000)
             if pg.locator("message-content").count() <= before:
                 continue
             txt = pg.locator("message-content").last.inner_text().strip()
