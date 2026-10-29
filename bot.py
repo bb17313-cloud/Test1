@@ -357,7 +357,7 @@ def ocr_image(path):
 
 
 def fetch_article(url):
-    r = requests.get(url, headers=WEB_HEADERS, timeout=30)
+    r = requests.get(url, headers=SEC_HEADERS if "sec.gov" in url else WEB_HEADERS, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.content, "lxml")
     title = (soup.title.string or url).strip() if soup.title else url
