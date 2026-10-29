@@ -1,1021 +1,987 @@
 # -*- coding: utf-8 -*-
 """
-بوت تلغرام: ترجمة / ملخص / تنزيل وتفريغ فيديو وصوت / تحليل أسهم / قراءة ملفات SEC / بحث ويكيبيديا
-المحرك: مواقع Gemini و Grok و Wikipedia عبر المتصفح (Playwright) بدون API وبدون أي سر (دخول زائر).
-(GEMINI_STATE اختياري: إن وُجد يُستخدم حساب Gemini المسجّل لحدود أوسع).
+بوت تلغرام (يعمل على GitHub Actions) - مصادر مجانية بدون أي API مدفوع
+------------------------------------------------------------------
+1) ترجمة أي نص / ملف / صورة / رابط إلى العربية   (Google Translate المجاني)
+2) تلخيص أي مستند (PDF, Word, PowerPoint, Excel, TXT, HTML, صور)  (تلخيص استخراجي محلي)
+3) تحليل أي سهم: النشاط، نتائج الربع، المستهدفات، المشاريع والعقود، الاتجاه،
+   زيادة/خفض رأس المال، التوزيعات، التقسيم العكسي، الخسائر المتراكمة، الأخبار
+   (Yahoo Finance + SEC EDGAR - بدون مفاتيح)
 
-أوضاع التشغيل:
-  python bot.py         -> تشغيل البوت (على GitHub Actions)
-  python bot.py login     -> تسجيل دخول Gemini مرة واحدة على جهازك وتوليد الجلسة
-
-المطلوب فقط: BOT_TOKEN, CHAT_ID (تلغرام) + SEC_USER_AGENT كنص عادي في bot.yml
+الأسرار المطلوبة: BOT_TOKEN, CHAT_ID
+اختياري: SEC_USER_AGENT (مثال: "MyBot myemail@gmail.com")
 """
 import os
 import re
 import sys
-import json
 import time
-import glob
-import gzip
-import base64
-import shutil
+import math
+import logging
 import tempfile
-import threading
-import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, quote_plus
+import xml.etree.ElementTree as ET
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
+from bs4 import BeautifulSoup
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID = str(os.environ.get("CHAT_ID", ""))
-BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://localhost:5000/ask")  # رابط الجسر المحلي الخاص بك
+# ──────────────────────────── الإعدادات ────────────────────────────
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+CHAT_ID = str(os.environ["CHAT_ID"]).strip()
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS") or 21000)
+SEC_UA = os.environ.get("SEC_USER_AGENT") or "TelegramStockBot admin@example.com"
+
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+}
+SEC_HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
 
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1800"))
-BRIDGE_TIMEOUT = int(os.environ.get("BRIDGE_TIMEOUT", "420"))
-SEC_UA = os.environ.get("SEC_USER_AGENT") or "StockBot admin@example.com"
-PROVIDERS = [x.strip() for x in (os.environ.get("PROVIDERS") or "gemini,grok").split(",") if x.strip()]
-GROK_URL = "https://grok.com"
-WIKI_URL = "https://ar.wikipedia.org"
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
-STATE_FILE = "gemini_state.json"
-GEMINI_URL = "https://gemini.google.com/app"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-BROWSER_ARGS = ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("bot")
 
-TRANSLATE_CHUNK = 8000
-SUMMARY_CHUNK = 30000
-SEC_CHUNK = 25000
-SEC_MAX_CHUNKS = 6
-
-# ============================================================
-# 1) جسر المتصفح (Gemini, Grok, Wikipedia عبر Playwright)
-# ============================================================
-
-
-class SessionExpired(Exception):
-    pass
+HELP = (
+    "👋 أهلاً! أرسل لي:\n\n"
+    "• أي نص ← أترجمه إلى العربية\n"
+    "• ملف (PDF / Word / PowerPoint / Excel / TXT / HTML) ← ألخّصه بالعربية\n"
+    "   ↳ اكتب «ترجم» في وصف الملف لترجمته كاملاً\n"
+    "• رابط مقال ← ألخّصه (أو «ترجم + الرابط» لترجمته)\n"
+    "• صورة ← أستخرج النص وأترجمه (أو «لخص» في الوصف)\n"
+    "• رمز سهم مثل AAPL أو رابط TradingView أو «تحليل AAPL» ← تحليل شامل\n\n"
+    "الأوامر: /tr ترجمة  |  /sum تلخيص  |  /stock تحليل سهم\n"
+    "يمكنك أيضاً الرد على أي رسالة أو ملف بكلمة «ترجم» أو «لخص»."
+)
 
 
-def _convert_cookies(arr):
-    """يحوّل تصدير Cookie-Editor (من الجوال) إلى صيغة Playwright."""
-    ss = {"strict": "Strict", "lax": "Lax", "no_restriction": "None", "none": "None"}
-    out = []
-    for c in arr:
-        d = c.get("domain", "")
-        if "google" not in d:
-            continue
-        exp = c.get("expirationDate") or c.get("expires")
-        out.append({
-            "name": c["name"], "value": c["value"], "domain": d,
-            "path": c.get("path", "/"),
-            "httpOnly": bool(c.get("httpOnly")), "secure": bool(c.get("secure")),
-            "sameSite": ss.get(str(c.get("sameSite", "")).lower(), "Lax"),
-            "expires": float(exp) if exp and not c.get("session") else -1,
-        })
-    return {"cookies": out, "origins": []}
-
-
-def _parse_state(raw):
-    raw = raw.strip()
-    if raw.startswith("["):
-        return _convert_cookies(json.loads(raw))
-    if raw.startswith("{"):
-        return json.loads(raw)
-    return json.loads(gzip.decompress(base64.b64decode(raw)).decode("utf-8"))
-
-
-def _prepare_state():
-    raw = os.environ.get("GEMINI_STATE", "").strip()
-    if raw:
-        path = os.path.join(tempfile.gettempdir(), "gemini_state_runtime.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(_parse_state(raw), f)
-        return path
-    if os.path.exists(STATE_FILE):
-        return STATE_FILE
-    return None  # وضع الزائر: بدون جلسة
-
-
-class GeminiBrowser:
-    def __init__(self):
-        self.pw = None
-        self.browser = None
-        self.ctx = None
-        self.page = None
-        self.gpage = None
-        self.wpage = None
-
-    def start(self):
-        from playwright.sync_api import sync_playwright
-        state = _prepare_state()
-        self.pw = sync_playwright().start()
-        self.browser = self.pw.chromium.launch(headless=True, args=BROWSER_ARGS)
-        kw = dict(user_agent=UA, viewport={"width": 1280, "height": 900}, locale="en-US")
-        if state:
-            kw["storage_state"] = state
-        self.ctx = self.browser.new_context(**kw)
-        self.page = self.ctx.new_page()
-
-    def _attach(self, path):
-        pg = self.page
+# ──────────────────────────── تلغرام ────────────────────────────
+def tg(method, files=None, timeout=60, **params):
+    params = {k: v for k, v in params.items() if v is not None}
+    for attempt in range(3):
         try:
-            with pg.expect_file_chooser(timeout=8000) as fc:
-                pg.locator("button[aria-label*='upload' i], button[aria-label*='Open upload' i]").first.click(timeout=5000)
-                pg.locator("[role='menuitem']:has-text('Upload files'), button:has-text('Upload files')").first.click(timeout=5000)
-            fc.value.set_files(path)
-        except Exception:
-            pg.set_input_files("input[type='file']", path)
-        pg.wait_for_timeout(5000)
-
-    def ask(self, prompt, image_path=None):
-        errors = []
-        for prov in PROVIDERS:
-            try:
-                if prov == "gemini":
-                    return self._ask_gemini(prompt, image_path)
-                if prov == "grok":
-                    return self._ask_grok(prompt, image_path)
-                if prov == "wiki":
-                    return self._ask_wiki(prompt)
-            except Exception as e:
-                errors.append(f"{prov}: {str(e)[:120]}")
-        raise RuntimeError(" | ".join(errors) or "لا يوجد مزوّد مفعّل")
-
-    def _ask_wiki(self, prompt, timeout=60):
-        """متصفح ويكيبيديا: يبحث في ويكيبيديا العربية ويستخرج الملخص من الصفحات."""
-        if self.wpage is None:
-            self.wpage = self.ctx.new_page()
-        pg = self.wpage
-        
-        # تنظيف الاستعلام أو استخدام محرك البحث الداخلي لويكيبيديا
-        search_url = f"{WIKI_URL}/w/index.php?search={quote_plus(prompt)}"
-        pg.goto(search_url, wait_until="domcontentloaded", timeout=timeout*1000)
-        pg.wait_for_timeout(2000)
-        
-        # إذا وجدنا مقالة مباشرة أو نتائج بحث
-        content_sel = "div.mw-parser-output p, div.searchresults"
-        try:
-            pg.locator(content_sel).first.wait_for(state="visible", timeout=10000)
-        except Exception:
-            pass
-            
-        # محاولة استخراج النصوص الأولى للمقالة أو نتائج البحث
-        paragraphs = pg.locator("div.mw-parser-output > p").all_inner_texts()
-        if not paragraphs:
-            paragraphs = pg.locator(".searchresult, .mw-search-result-heading").all_inner_texts()
-            
-        if paragraphs:
-            result_text = "\n".join([p.strip() for p in paragraphs[:5] if p.strip()])
-            if result_text:
-                return f"📖 **من ويكيبيديا:**\n\n{result_text[:3500]}"
-                
-        return "⚠️ لم أجد نتائج مطابقة في ويكيبيديا لهذا الطلب."
-
-    def _ask_grok(self, prompt, image_path=None, timeout=360):
-        if self.gpage is None:
-            self.gpage = self.ctx.new_page()
-        pg = self.gpage
-        fresh = False
-        if pg.url.startswith(GROK_URL):
-            try:
-                pg.locator("a[href='/'], button[aria-label*='New chat' i]").first.click(timeout=3000)
-                pg.wait_for_timeout(500)
-                fresh = True
-            except Exception:
-                pass
-        if not fresh:
-            pg.goto(GROK_URL, wait_until="domcontentloaded", timeout=60000)
-            pg.wait_for_timeout(4000)
-        if "just a moment" in (pg.title() or "").lower():
-            pg.wait_for_timeout(10000)
-            if "just a moment" in (pg.title() or "").lower():
-                raise RuntimeError("Cloudflare حجب الدخول إلى Grok")
-        box = pg.locator("textarea, div[contenteditable='true']").first
-        box.wait_for(state="visible", timeout=30000)
-        if image_path:
-            pg.set_input_files("input[type='file']", image_path)
-            pg.wait_for_timeout(5000)
-        sel = ".response-content-markdown"
-        before = pg.locator(sel).count()
-        box.click()
-        box.fill(prompt)
-        pg.wait_for_timeout(800)
-        try:
-            pg.locator("button[type='submit'], button[aria-label*='Submit' i], button[aria-label*='Send' i]").first.click(timeout=5000)
-        except Exception:
-            pg.keyboard.press("Enter")
-        deadline = time.time() + timeout
-        last, stable = "", 0
-        while time.time() < deadline:
-            pg.wait_for_timeout(1000)
-            if pg.locator(sel).count() <= before:
+            r = requests.post(f"{API}/{method}", data=params, files=files, timeout=timeout)
+            j = r.json()
+            if j.get("ok"):
+                return j["result"]
+            log.warning("tg %s failed: %s", method, j)
+            if r.status_code == 429:
+                time.sleep(int(j.get("parameters", {}).get("retry_after", 3)) + 1)
                 continue
-            txt = pg.locator(sel).last.inner_text().strip()
-            generating = pg.locator("button[aria-label*='Stop' i]").count() > 0
-            if txt and txt == last and not generating:
-                stable += 1
-            else:
-                stable = 0
-            last = txt
-            if stable >= 2:
-                return txt
-        raise TimeoutError("انتهت مهلة انتظار رد Grok")
-
-    def _ask_gemini(self, prompt, image_path=None, timeout=360):
-        pg = self.page
-        fresh = False
-        if pg.url.startswith(GEMINI_URL):
-            try:
-                pg.locator("a[aria-label*='New chat' i], button[aria-label*='New chat' i]").first.click(timeout=3000)
-                pg.wait_for_timeout(500)
-                fresh = True
-            except Exception:
-                pass
-        if not fresh:
-            pg.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=60000)
-        if "consent.google" in pg.url:
-            try:
-                pg.locator("button:has-text('Reject all'), button:has-text('Accept all')").first.click(timeout=5000)
-                pg.wait_for_timeout(3000)
-            except Exception:
-                pass
-        box = pg.locator("rich-textarea div.ql-editor, div.ql-editor[contenteditable='true']").first
-        try:
-            box.wait_for(state="visible", timeout=30000)
-        except Exception:
-            if "accounts.google" in pg.url:
-                raise SessionExpired()
-            raise
-        if "accounts.google" in pg.url:
-            raise SessionExpired()
-
-        if image_path:
-            self._attach(image_path)
-
-        before = pg.locator("message-content").count()
-        box.click()
-        box.fill(prompt)
-        pg.wait_for_timeout(800)
-        try:
-            pg.locator("button.send-button").first.click(timeout=5000)
-        except Exception:
-            pg.keyboard.press("Enter")
-
-        deadline = time.time() + timeout
-        last, stable = "", 0
-        while time.time() < deadline:
-            pg.wait_for_timeout(1000)
-            if pg.locator("message-content").count() <= before:
-                continue
-            txt = pg.locator("message-content").last.inner_text().strip()
-            generating = pg.locator("button.send-button.stop, button[aria-label*='Stop' i]").count() > 0
-            if txt and txt == last and not generating:
-                stable += 1
-            else:
-                stable = 0
-            last = txt
-            if stable >= 2:
-                return txt
-        raise TimeoutError("انتهت مهلة انتظار رد Gemini")
-
-
-_BROWSER = None
-
-
-class _Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def _reply(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_POST(self):
-        try:
-            n = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(n) or b"{}")
-            res = _BROWSER.ask(data.get("prompt", ""), data.get("image_path"))
-            self._reply({"status": "success", "result": res})
-        except SessionExpired:
-            self._reply({"status": "error", "message": "Gemini طلب تسجيل دخول (وضع الزائر غير متاح لك)"})
-        except Exception as e:
-            self._reply({"status": "error", "message": str(e)[:300]})
-
-
-def start_bridge():
-    """يشغّل الجسر داخل خيط مستقل إذا كان BRIDGE_URL محلياً."""
-    global _BROWSER
-    u = urlparse(BRIDGE_URL)
-    if u.hostname not in ("localhost", "127.0.0.1"):
-        return True
-    ready, err = threading.Event(), []
-
-    def run():
-        global _BROWSER
-        try:
-            _BROWSER = GeminiBrowser()
-            _BROWSER.start()
-            srv = HTTPServer(("127.0.0.1", u.port or 5000), _Handler)
-        except Exception as e:
-            err.append(str(e))
-            ready.set()
-            return
-        ready.set()
-        srv.serve_forever()
-
-    threading.Thread(target=run, daemon=True).start()
-    ready.wait(120)
-    if err:
-        print("Bridge start error:", err[0])
-        return False
-    return True
-
-
-def login_mode():
-    """تسجيل دخول Gemini مرة واحدة على جهازك وتوليد الجلسة."""
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(channel="chrome", headless=False, args=BROWSER_ARGS,
-                                        ignore_default_args=["--enable-automation"])
-        except Exception:
-            browser = p.chromium.launch(headless=False, args=BROWSER_ARGS,
-                                        ignore_default_args=["--enable-automation"])
-        ctx = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 900}, locale="en-US")
-        page = ctx.new_page()
-        page.goto(GEMINI_URL)
-        input("سجّل دخولك في Gemini داخل النافذة، وعندما تظهر صفحة المحادثة اضغط Enter هنا... ")
-        st = ctx.storage_state()
-        st["cookies"] = [c for c in st["cookies"] if "google" in c.get("domain", "")]
-        st["origins"] = []
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(st, f)
-        b64 = base64.b64encode(gzip.compress(json.dumps(st).encode("utf-8"))).decode()
-        with open("gemini_state.b64.txt", "w") as f:
-            f.write(b64)
-        print("تم. انسخ محتوى الملف gemini_state.b64.txt كاملاً إلى سر GitHub باسم GEMINI_STATE")
-        browser.close()
-
-
-# ============================================================
-# 2) تلغرام
-# ============================================================
-
-
-def send_message(chat_id, text, reply_to=None):
-    try:
-        requests.post(f"{API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "reply_to_message_id": reply_to
-        }, timeout=30)
-    except Exception as e:
-        print("Telegram send error:", e)
-
-
-def send_long(chat_id, text, reply_to=None, limit=3900):
-    text = (text or "").strip() or "⚠️ لا يوجد نص."
-    while text:
-        if len(text) <= limit:
-            send_message(chat_id, text, reply_to)
-            break
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        send_message(chat_id, text[:cut], reply_to)
-        text = text[cut:].lstrip("\n")
-
-
-def send_file(chat_id, path, kind="document", caption="", reply_to=None):
-    ep = {"video": ("sendVideo", "video"), "audio": ("sendAudio", "audio"),
-          "document": ("sendDocument", "document")}[kind]
-    try:
-        with open(path, "rb") as f:
-            requests.post(f"{API}/{ep[0]}", data={"chat_id": chat_id, "caption": caption[:900],
-                                                 "reply_to_message_id": reply_to or ""},
-                        files={ep[1]: f}, timeout=300)
-    except Exception as e:
-        print("Telegram file error:", e)
-
-
-def tg_download(file_id, dest_dir, name=None):
-    """تنزيل ملف من تلغرام (الحد 20MB). يرجع المسار أو None."""
-    try:
-        r = requests.get(f"{API}/getFile", params={"file_id": file_id}, timeout=30).json()
-        if not r.get("ok"):
             return None
-        fp = r["result"]["file_path"]
-        dest = os.path.join(dest_dir, name or os.path.basename(fp))
-        data = requests.get(f"{FILE_API}/{fp}", timeout=180)
-        with open(dest, "wb") as f:
-            f.write(data.content)
-        return dest
-    except Exception as e:
-        print("tg_download error:", e)
-        return None
-
-
-def process_via_bridge(prompt_text, image_path=None):
-    try:
-        payload = {"prompt": prompt_text}
-        if image_path:
-            payload["image_path"] = image_path
-        r = requests.post(BRIDGE_URL, json=payload, timeout=BRIDGE_TIMEOUT)
-        res = r.json()
-        if res.get("status") == "success":
-            return res.get("result", "⚠️ تم التوليد بنجاح ولكن النص فارغ.")
-        else:
-            return f"❌ خطأ من الجسر: {res.get('message')}"
-    except Exception as e:
-        return f"❌ تعذر الاتصال بالجسر المحلي: {str(e)}"
-
-
-def is_err(s):
-    return isinstance(s, str) and s.startswith("❌")
-
-
-# ============================================================
-# 3) أدوات النصوص: تقسيم / ترجمة / ملخص
-# ============================================================
-
-
-def chunk_text(text, size):
-    parts, cur = [], ""
-    for para in text.split("\n"):
-        if len(cur) + len(para) + 1 > size and cur:
-            parts.append(cur)
-            cur = ""
-        while len(para) > size:
-            parts.append(para[:size])
-            para = para[size:]
-        cur += para + "\n"
-    if cur.strip():
-        parts.append(cur)
-    return parts
-
-
-def is_arabic(t):
-    ar = len(re.findall(r"[\u0600-\u06FF]", t))
-    al = len(re.findall(r"\w", t))
-    return al > 0 and ar / al > 0.5
-
-
-def translate_to_arabic(text):
-    out = []
-    for ch in chunk_text(text, TRANSLATE_CHUNK):
-        ans = process_via_bridge(
-            "ترجم النص التالي إلى العربية الفصحى بدقة وأمانة دون إضافة أو حذف، "
-            "وأعد الترجمة فقط بدون مقدمات:\n\n" + ch)
-        if is_err(ans):
-            return ans
-        out.append(ans)
-    return "\n\n".join(out)
-
-
-def summarize_text(text):
-    chunks = chunk_text(text, SUMMARY_CHUNK)
-    if len(chunks) == 1:
-        return process_via_bridge(
-            "لخّص النص التالي باللغة العربية في نقاط واضحة تشمل الأفكار الرئيسية والأرقام والتواريخ "
-            "المهمة، ثم خلاصة في سطرين:\n\n" + text)
-    partial = []
-    for i, ch in enumerate(chunks, 1):
-        ans = process_via_bridge(f"لخّص الجزء {i} من {len(chunks)} بالعربية مع الاحتفاظ بالأرقام والتواريخ:\n\n" + ch)
-        if is_err(ans):
-            return ans
-        partial.append(ans)
-    return process_via_bridge(
-        "هذه ملخصات أجزاء مستند واحد. ادمجها في ملخص عربي واحد منظم بنقاط، ثم خلاصة في سطرين:\n\n"
-        + "\n\n".join(partial))
-
-
-# ============================================================
-# 4) الفيديو والصوت: yt-dlp + faster-whisper
-# ============================================================
-
-MEDIA_DOMAINS = ("youtube.com", "youtu.be", "x.com", "twitter.com", "tiktok.com", "instagram.com",
-                 "facebook.com", "fb.watch", "vimeo.com", "twitch.tv", "soundcloud.com", "dailymotion.com")
-_whisper = None
-
-
-def _run(cmd, timeout=900):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-
-def download_media(url, workdir, want_video, want_audio):
-    video = audio = None
-    base = os.path.join(workdir, "%(title).60s.%(ext)s")
-    if want_video:
-        _run(["yt-dlp", "--no-playlist", "--restrict-filenames", "-f",
-              "bv*[height<=480]+ba/b[height<=480]/b", "--merge-output-format", "mp4",
-              "--max-filesize", "49M", "-o", base, url])
-        vids = [p for p in glob.glob(os.path.join(workdir, "*.mp4"))]
-        video = vids[0] if vids else None
-    if want_audio:
-        _run(["yt-dlp", "--no-playlist", "--restrict-filenames", "-x", "--audio-format", "mp3",
-              "--audio-quality", "5", "-o", base, url])
-        auds = glob.glob(os.path.join(workdir, "*.mp3"))
-        audio = auds[0] if auds else None
-    return video, audio
-
-
-def transcribe(path):
-    global _whisper
-    from faster_whisper import WhisperModel
-    if _whisper is None:
-        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    segments, info = _whisper.transcribe(path, vad_filter=True, beam_size=1)
-    text = "\n".join(s.text.strip() for s in segments)
-    return text.strip(), info.language
-
-
-def transcript_flow(chat_id, mid, audio_path):
-    send_message(chat_id, "🎙️ جاري التفريغ...", mid)
-    text, lang = transcribe(audio_path)
-    if not text:
-        send_message(chat_id, "⚠️ لم أستطع استخراج كلام من الملف.", mid)
-        return
-    d = os.path.dirname(audio_path)
-    orig = os.path.join(d, "transcript_original.txt")
-    with open(orig, "w", encoding="utf-8") as f:
-        f.write(text)
-    send_file(chat_id, orig, "document", f"📝 التفريغ الأصلي (اللغة: {lang})", mid)
-    if lang == "ar":
-        return
-    send_message(chat_id, "🌐 جاري الترجمة للعربية...", mid)
-    ar = translate_to_arabic(text)
-    if is_err(ar):
-        send_message(chat_id, ar, mid)
-        return
-    arp = os.path.join(d, "transcript_arabic.txt")
-    with open(arp, "w", encoding="utf-8") as f:
-        f.write(ar)
-    send_file(chat_id, arp, "document", "📝 التفريغ مترجماً للعربية", mid)
-    send_long(chat_id, ar[:3800], mid)
-
-
-def media_flow(chat_id, mid, url, mode="all"):
-    wd = tempfile.mkdtemp(prefix="media_")
-    try:
-        send_message(chat_id, "⬇️ جاري التنزيل...", mid)
-        want_video = mode in ("all", "video")
-        want_audio = mode in ("all", "audio", "transcript")
-        video, audio = download_media(url, wd, want_video, want_audio)
-        if not video and not audio:
-            send_message(chat_id, "❌ تعذر تنزيل الرابط (قد يكون خاصاً أو غير مدعوم).", mid)
-            return
-        if video and os.path.getsize(video) <= 49 * 1024 * 1024:
-            send_file(chat_id, video, "video", "🎬 الفيديو", mid)
-        elif want_video:
-            send_message(chat_id, "⚠️ الفيديو أكبر من حد تلغرام (50MB) فلم يُرسل.", mid)
-        if audio and mode in ("all", "audio"):
-            if os.path.getsize(audio) <= 49 * 1024 * 1024:
-                send_file(chat_id, audio, "audio", "🎧 الصوت", mid)
-        if audio and mode in ("all", "transcript"):
-            transcript_flow(chat_id, mid, audio)
-    finally:
-        shutil.rmtree(wd, ignore_errors=True)
-
-
-# ============================================================
-# 5) SEC EDGAR (بدون API key - يلزم User-Agent)
-# ============================================================
-
-_sec_tickers = None
-DILUTION_PREFIX = ("424B", "S-1", "S-3", "F-1", "F-3", "8-K", "6-K")
-WATCH_PREFIX = DILUTION_PREFIX + ("10-K", "10-Q", "20-F", "SC 13", "SCHEDULE 13", "EFFECT", "DEF 14", "S-8")
-
-
-def sec_get(url, **kw):
-    time.sleep(0.2)
-    return requests.get(url, headers={"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}, timeout=40, **kw)
-
-
-def sec_cik(sym):
-    global _sec_tickers
-    try:
-        if _sec_tickers is None:
-            _sec_tickers = sec_get("https://www.sec.gov/files/company_tickers.json").json()
-        for v in _sec_tickers.values():
-            if v["ticker"].upper() == sym.upper():
-                return str(v["cik_str"]).zfill(10)
-    except Exception as e:
-        print("sec_cik error:", e)
+        except Exception as e:  # noqa
+            log.warning("tg %s error: %s", method, e)
+            time.sleep(2)
     return None
 
 
-def sec_recent_filings(cik, limit=25):
+def send(chat_id, text, reply_to=None):
+    text = (text or "").strip()
+    if not text:
+        return
+    while text:
+        if len(text) <= 3900:
+            part, text = text, ""
+        else:
+            cut = text.rfind("\n", 0, 3900)
+            cut = cut if cut > 1500 else 3900
+            part, text = text[:cut], text[cut:].lstrip("\n")
+        tg("sendMessage", chat_id=chat_id, text=part, reply_to_message_id=reply_to,
+           disable_web_page_preview="true")
+        reply_to = None
+
+
+def send_doc(chat_id, content, filename, caption=None):
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    tg("sendDocument", files={"document": (filename, data)}, chat_id=chat_id,
+       caption=caption, timeout=120)
+
+
+def typing(chat_id):
+    tg("sendChatAction", chat_id=chat_id, action="typing", timeout=15)
+
+
+def download_file(file_id):
+    info = tg("getFile", file_id=file_id)
+    if not info or not info.get("file_path"):
+        raise RuntimeError("تعذّر تنزيل الملف (حدّ تلغرام للبوتات 20MB)")
+    r = requests.get(f"{FILE_API}/{info['file_path']}", timeout=120)
+    r.raise_for_status()
+    return r.content
+
+
+# ──────────────────────────── أدوات النص ────────────────────────────
+def is_arabic(text, threshold=0.5):
+    letters = re.findall(r"[^\W\d_]", text or "")
+    if not letters:
+        return False
+    ar = sum(1 for c in letters if "\u0600" <= c <= "\u06FF")
+    return ar / len(letters) >= threshold
+
+
+def chunk_text(text, limit=4000):
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            cut = max(line.rfind(". ", 0, limit), line.rfind(" ", 0, limit))
+            cut = cut if cut > limit // 2 else limit
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:cut])
+            line = line[cut:].lstrip()
+        if len(cur) + len(line) + 1 > limit and cur:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _translate_chunk(chunk):
+    if not chunk.strip():
+        return chunk
+    for attempt in range(3):
+        try:
+            from deep_translator import GoogleTranslator
+            out = GoogleTranslator(source="auto", target="ar").translate(chunk)
+            if out:
+                return out
+        except Exception as e:  # noqa
+            log.warning("deep_translator: %s", e)
+            time.sleep(1.5 * (attempt + 1))
+    try:  # احتياطي: نقطة Google المجانية مباشرة
+        r = requests.post(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "ar", "dt": "t"},
+            data={"q": chunk}, headers=WEB_HEADERS, timeout=30)
+        data = r.json()
+        return "".join(x[0] for x in data[0] if x and x[0])
+    except Exception as e:  # noqa
+        log.warning("gtx fallback: %s", e)
+        return chunk
+
+
+def translate_ar(text):
+    text = (text or "").strip()
+    if not text or is_arabic(text):
+        return text
+    return "\n".join(_translate_chunk(c) for c in chunk_text(text, 4000))
+
+
+def translate_lines(lines):
+    """ترجمة قائمة أسطر مع الحفاظ على الترتيب."""
+    lines = [l.strip() for l in lines]
+    result, group, idx = [None] * len(lines), [], []
+
+    def flush():
+        if not group:
+            return
+        out = _translate_chunk("\n".join(group)).split("\n")
+        if len(out) == len(group):
+            for i, o in zip(idx, out):
+                result[i] = o.strip()
+        else:
+            for i, g in zip(idx, group):
+                result[i] = _translate_chunk(g).strip()
+        group.clear()
+        idx.clear()
+
+    size = 0
+    for i, l in enumerate(lines):
+        if not l or is_arabic(l):
+            result[i] = l
+            continue
+        if size + len(l) > 3500:
+            flush()
+            size = 0
+        group.append(l.replace("\n", " "))
+        idx.append(i)
+        size += len(l) + 1
+    flush()
+    return [r if r is not None else l for r, l in zip(result, lines)]
+
+
+# ──────────────────────────── التلخيص ────────────────────────────
+def split_sentences(text):
+    text = re.sub(r"[ \t\u00a0]+", " ", text or "")
+    text = re.sub(r"(?<![.!?؟:\n])\n(?!\n)", " ", text)  # دمج أسطر PDF المكسورة
+    parts = re.split(r"(?<=[.!?؟])\s+|\n+", text)
+    return [p.strip() for p in parts if 30 <= len(p.strip()) <= 700]
+
+
+def summarize_extractive(text, n=None):
+    sents = split_sentences(text)
+    if len(sents) <= 6:
+        return sents
+    n = n or max(5, min(14, len(sents) // 10))
+    toks = [set(re.findall(r"\w{3,}", s.lower())) for s in sents]
+    df = Counter(w for t in toks for w in t)
+    limit = max(3, int(len(sents) * 0.4))
+    freq = Counter()
+    for s in sents:
+        for w in re.findall(r"\w{3,}", s.lower()):
+            if df[w] <= limit:  # استبعاد الكلمات الشائعة جداً
+                freq[w] += 1
+    scores = []
+    for i, s in enumerate(sents):
+        words = re.findall(r"\w{3,}", s.lower())
+        if not words:
+            scores.append(0)
+            continue
+        sc = sum(freq[w] for w in set(words)) / (len(words) ** 0.7 + 1)
+        if i < 3:
+            sc *= 1.3
+        if re.search(r"\d", s):
+            sc *= 1.1
+        scores.append(sc)
+    chosen = []
+    for i in sorted(range(len(sents)), key=lambda k: scores[k], reverse=True):
+        if len(chosen) >= n:
+            break
+        if any(len(toks[i] & toks[j]) / max(1, len(toks[i] | toks[j])) > 0.55 for j in chosen):
+            continue
+        chosen.append(i)
+    return [sents[i] for i in sorted(chosen)]
+
+
+def key_figures(text, exclude, limit=5):
+    pat = re.compile(r"(\$|€|£|%|\d[\d,\.]*\s?(million|billion|مليون|مليار|M|B)\b)", re.I)
     out = []
-    try:
-        j = sec_get(f"https://data.sec.gov/submissions/CIK{cik}.json").json()
-        rec = j["filings"]["recent"]
-        for i in range(min(len(rec["form"]), 120)):
-            form = rec["form"][i]
-            if form == "4" or form == "4/A" or form.upper().startswith(WATCH_PREFIX):
-                acc = rec["accessionNumber"][i].replace("-", "")
-                url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{rec['primaryDocument'][i]}"
-                out.append({"form": form, "date": rec["filingDate"][i], "url": url})
-            if len(out) >= limit:
-                break
-    except Exception as e:
-        print("sec_recent error:", e)
+    for s in split_sentences(text):
+        if s not in exclude and pat.search(s):
+            out.append(s)
+        if len(out) >= limit:
+            break
     return out
 
 
-def html_to_text(html):
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    for t in soup(["script", "style"]):
-        t.decompose()
-    return re.sub(r"\n\s*\n+", "\n", soup.get_text("\n")).strip()
+def build_summary(text, title):
+    words = len(text.split())
+    sents = summarize_extractive(text)
+    if not sents:
+        return "⚠️ النص قصير أو غير قابل للتلخيص."
+    ar = translate_lines(sents)
+    out = [f"📝 ملخص: {title}", f"(الحجم الأصلي ≈ {words:,} كلمة)", ""]
+    out += [f"• {s}" for s in ar]
+    figs = key_figures(text, set(sents))
+    if figs:
+        out += ["", "📌 أرقام ومبالغ بارزة:"] + [f"• {s}" for s in translate_lines(figs)]
+    return "\n".join(out)
 
 
-def pdf_to_text(path):
-    from pypdf import PdfReader
-    return "\n".join((p.extract_text() or "") for p in PdfReader(path).pages)
-
-
-def fetch_url_text(url):
-    r = sec_get(url) if "sec.gov" in url else requests.get(url, headers={"User-Agent": UA}, timeout=40)
-    if url.lower().endswith(".pdf") or "pdf" in r.headers.get("Content-Type", ""):
-        p = os.path.join(tempfile.gettempdir(), "dl.pdf")
-        with open(p, "wb") as f:
-            f.write(r.content)
-        return pdf_to_text(p)
-    return html_to_text(r.text)
-
-
-def sec_context(sym):
-    cik = sec_cik(sym)
-    if not cik:
-        return "لا توجد بيانات SEC لهذا الرمز (قد يكون أجنبياً أو غير مسجل في EDGAR)."
-    filings = sec_recent_filings(cik)
-    if not filings:
-        return "تعذر جلب قائمة إفصاحات SEC."
-    lines = ["أحدث إفصاحات SEC (تاريخ | نموذج | رابط):"]
-    lines += [f"{f['date']} | {f['form']} | {f['url']}" for f in filings]
-    texts, n = [], 0
-    for f in filings:
-        if n >= 2:
-            break
-        if f["form"].upper().startswith(DILUTION_PREFIX):
-            try:
-                t = fetch_url_text(f["url"])[:12000]
-                texts.append(f"\n--- نص مقتطف من {f['form']} بتاريخ {f['date']} ---\n{t}")
-                n += 1
-            except Exception as e:
-                print("filing fetch error:", e)
-    return "\n".join(lines) + "\n" + "\n".join(texts)
-
-
-SEC_PROMPT = """حلّل إفصاح SEC التالي وأجب بالعربية بهذا الترتيب:
-1) نوع الوثيقة والشركة وتاريخها.
-2) ملخص عربي واضح.
-3) ✅ الإيجابيات.
-4) ❌ السلبيات والمخاطر.
-5) الورنتس (Warrants): العدد، سعر التنفيذ، تاريخ الانتهاء، شروط التنفيذ الإجباري/Cashless، أي آلية إعادة تسعير.
-6) زيادة الأسهم / الطرح: سعر الطرح، عدد الأسهم، المستثمرون، استخدام العوائد، نسبة التخفيف المتوقعة.
-7) 🎯 المحفزات والأسعار: متى وعند أي سعر يصبح تنفيذ الورنتس أو زيادة الأسهم مجدياً أو ضاغطاً على السعر، وأي تواريخ مهمة (Lock-up، سريان التسجيل، انتهاء الورنتس).
-8) ترجمة عربية للفقرات الجوهرية فقط.
-لا تخترع أي رقم؛ إن لم يكن مذكوراً اكتب «غير مذكور».
-"""
-
-
-def analyze_sec_text(text):
-    chunks = chunk_text(text, SEC_CHUNK)[:SEC_MAX_CHUNKS]
-    if not chunks:
-        return "⚠️ لم أستطع قراءة نص الوثيقة."
-    if len(chunks) == 1:
-        return process_via_bridge(SEC_PROMPT + "\nالنص:\n" + chunks[0])
-    facts = []
-    for i, ch in enumerate(chunks, 1):
-        ans = process_via_bridge(
-            f"هذا الجزء {i} من {len(chunks)} من إفصاح SEC. استخرج منه فقط الحقائق والأرقام المتعلقة بـ: "
-            "الورنتس وأسعار تنفيذها، الطرح وزيادة الأسهم وأسعارها، التخفيف، الديون القابلة للتحويل، "
-            "التواريخ المهمة، المخاطر، النقاط الإيجابية. اكتبها بالعربية في نقاط مختصرة:\n\n" + ch)
-        if is_err(ans):
-            return ans
-        facts.append(ans)
-    return process_via_bridge(SEC_PROMPT + "\nهذه الحقائق المستخرجة من أجزاء الوثيقة:\n\n" + "\n\n".join(facts))
-
-
-# ============================================================
-# 6) تحليل الأسهم
-# ============================================================
-
-STOCK_RULES = """أولاً وبقوة تصفير القراءات السابقة التاريخية للسعر عندك خذ سعر لحظي الآن GOOGLEFINANCE("NASDAQ:{SYM}", "price") استخدم الأداة "Google Search" Analytical Engine & (Agentic Capabilities) طبق بروتوكول [L3-MBO] المحدث: اسحب السعر اللحظي (Tick-by-Tick) لهذا السهم من بيانات Nasdaq TotalView nasdaq و Webull L2 المتقاطعة للحظة الحالية [2026]. تأكد من السيولة العميقة (Level 3) قبل تحليل الأهداف والدخول. حتى مع التداولات الساعات الممتدة وحدد:- دخول من الدعم والدعم القوي… 📍 أو اختراق 🎯 هدف أول، هدف ثاني، هدف ثالث، هدف رابع 🟢 وقد يصل إلى (لا تتجاهلها أساسية) ⛔ وقف الخسارة أولي / ثاني / دموي. هذه قاعدة إذا أعطيتك سهم في الأمريكي طبقها مع التأكيد (L3) أضف:
-1- بيانات Dark Pool الحقيقية
-2- أماكن السيولة level 2 في live fitch (ELZ3/ILZ) bookmap Level 2 (MBO (High Liquidity Clusters) Limit Orders Absorption Spoofing Trap Tape Speed Exhaustion (Iceberg Orders). Stop & Iceberg Tracker Large Lot Tracker (LLT) Sweep Indicator Advanced Volume Delta Whale Watch ThiccZones Tape Speed CVD (Cumulative Volume Delta) Volume Stripes Slope Up. راقب بدقة ظهور النقاط الكبيرة ((Price Action Audit)
-3- الورنتس والإصدارات مع تسعيرها (Liquidity & Dilution Risk & Convertible Notes) نماذج إفصاح (SEC Filing) حديث وفعال بيتا +-
-4- الأخبار والمحفزات Forward Catalysts Earnings Beat / Guidance / رادار صفقات المطلعين (Insider Trading) شراء أو بيع The Guidance Sandbagging
-5- نشاط الشركة باختصار Sparkline
-6- الدولة
-7- وهل مدرجة في بورصات أخرى؟ اذكرها."""
-
-STOCK_TAIL = """
-اكتب الإجابة بالعربية بهذا الترتيب: (1) السعر اللحظي مع قبل/بعد الجلسة وقراءة الشارت، (2) الدخول والأهداف الأربعة والوقف الثلاثي،
-(3) L3 / Dark Pool / مناطق السيولة، (4) الورنتس والإصدارات وتسعيرها ومخاطر التخفيف، (5) الأخبار والمحفزات والمطلعين،
-(6) نشاط الشركة، الدولة، البورصات الأخرى.
-مهم: أي بيان لا تستطيع الوصول إليه فعلياً (مثل Dark Pool الحقيقي أو بيانات Level 3 / MBO الحية) اكتب أمامه «غير متاح» أو «تقدير» ولا تخترع أرقاماً.
-"""
-
-
-def live_quote(sym):
+# ──────────────────────────── استخراج النصوص ────────────────────────────
+def extract_text(data, name):
+    ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+    with tempfile.NamedTemporaryFile(suffix="." + (ext or "bin"), delete=False) as f:
+        f.write(data)
+        path = f.name
     try:
-        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
-                         params={"interval": "1m", "range": "1d", "includePrePost": "true"},
-                         headers={"User-Agent": UA}, timeout=20)
-        res = r.json()["chart"]["result"][0]
-        m = res["meta"]
-        closes = res["indicators"]["quote"][0].get("close", [])
-        ts = res.get("timestamp", [])
-        last_px, last_t = None, None
-        for i in range(len(closes) - 1, -1, -1):
-            if closes[i] is not None:
-                last_px, last_t = closes[i], ts[i]
-                break
-        t_txt = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(last_t)) if last_t else "؟"
-        return (f"Yahoo Finance: آخر سعر شمعة 1د = {last_px} ({t_txt}) | سعر الجلسة الرسمية = {m.get('regularMarketPrice')} | "
-                f"الإغلاق السابق = {m.get('chartPreviousClose')} | أعلى اليوم = {m.get('regularMarketDayHigh')} | "
-                f"أدنى اليوم = {m.get('regularMarketDayLow')} | الحجم = {m.get('regularMarketVolume')} | "
-                f"البورصة = {m.get('exchangeName')} | العملة = {m.get('currency')}")
-    except Exception as e:
-        print("live_quote error:", e)
-        return "تعذر جلب سعر Yahoo - اعتمد على البحث الحي."
+        if ext == "pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            pages = [(p.extract_text() or "") for p in reader.pages[:300]]
+            text = "\n\n".join(pages)
+            if len(text.strip()) < 50:
+                raise RuntimeError("ملف PDF ممسوح ضوئياً (صور بلا نص). أرسل صفحاته كصور ليتم استخراج النص منها.")
+            return text
+        if ext == "docx":
+            import docx
+            d = docx.Document(path)
+            parts = [p.text for p in d.paragraphs]
+            for tb in d.tables:
+                for row in tb.rows:
+                    parts.append(" | ".join(c.text.strip() for c in row.cells))
+            return "\n".join(parts)
+        if ext == "pptx":
+            from pptx import Presentation
+            prs, parts = Presentation(path), []
+            for i, slide in enumerate(prs.slides, 1):
+                parts.append(f"\nشريحة {i}")
+                for sh in slide.shapes:
+                    if sh.has_text_frame:
+                        parts.append(sh.text_frame.text)
+            return "\n".join(parts)
+        if ext in ("xlsx", "xlsm"):
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            parts = []
+            for ws in wb.worksheets:
+                parts.append(f"\nورقة: {ws.title}")
+                for n, row in enumerate(ws.iter_rows(values_only=True)):
+                    if n > 2000:
+                        break
+                    cells = [str(c) for c in row if c is not None]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts)
+        if ext in ("html", "htm"):
+            soup = BeautifulSoup(data, "lxml")
+            for t in soup(["script", "style", "noscript"]):
+                t.decompose()
+            return soup.get_text("\n")
+        if ext in ("png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"):
+            return ocr_image(path)
+        if ext in ("doc", "xls", "ppt"):
+            raise RuntimeError("الصيغ القديمة (doc/xls/ppt) غير مدعومة، احفظ الملف بصيغة docx/xlsx/pptx.")
+        for enc in ("utf-8", "cp1256", "latin-1"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        raise RuntimeError("صيغة الملف غير مدعومة.")
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
-def build_stock_prompt(sym, quote, sec_block, has_image):
-    p = STOCK_RULES.replace("{SYM}", sym)
-    if has_image:
-        p = "هذه صورة شارت للسهم. استخدمها في قراءة الشارت والدعوم والمقاومات.\n" + p
-    p += f"\n\nالسهم: {sym}\nبيانات لحظية جُلبت للتو: {quote}\n"
-    if sec_block:
-        p += f"\nبيانات SEC المجلوبة:\n{sec_block}\n"
-    return p + STOCK_TAIL
+def ocr_image(path):
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(path)
+        try:
+            txt = pytesseract.image_to_string(img, lang="ara+eng")
+        except Exception:
+            txt = pytesseract.image_to_string(img)
+        if not txt.strip():
+            raise RuntimeError("لم أجد نصاً داخل الصورة.")
+        return txt
+    except ImportError:
+        raise RuntimeError("OCR غير مثبّت على السيرفر.")
 
 
-def analyze_stock(sym, image_path=None):
-    quote = live_quote(sym) if sym else "غير متاح"
-    sec_block = sec_context(sym) if sym else ""
-    prompt = build_stock_prompt(sym or "السهم الظاهر في الشارت", quote, sec_block, bool(image_path))
-    return process_via_bridge(prompt, image_path)
+def fetch_article(url):
+    r = requests.get(url, headers=WEB_HEADERS, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.content, "lxml")
+    title = (soup.title.string or url).strip() if soup.title else url
+    for t in soup(["script", "style", "noscript", "nav", "footer", "aside", "form", "header"]):
+        t.decompose()
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    paras = [p.get_text(" ", strip=True) for p in root.find_all(["p", "h1", "h2", "h3", "li"])]
+    text = "\n".join(p for p in paras if len(p) > 25)
+    if len(text) < 200:
+        text = root.get_text("\n", strip=True)
+    return title, text
 
 
-TICKER_RE = re.compile(r"^[A-Z][A-Z.\-]{0,5}$")
+# ──────────────────────────── تحليل الأسهم ────────────────────────────
+def num(x):
+    try:
+        v = float(x)
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    except Exception:
+        return None
 
 
-def ticker_from_url(url):
-    pats = [r"[?&]symbol=(?:[A-Za-z]+(?:%3A|:))?([A-Za-z.\-]{1,8})",
-            r"symbols/(?:[A-Za-z]+[-:])?([A-Za-z.]{1,6})/?",
-            r"google\.com/finance/quote/([A-Za-z.\-]{1,8})",
-            r"quote/([A-Za-z.\-]{1,8})", r"[?&]t=([A-Za-z.\-]{1,8})",
-            r"stocks/([A-Za-z.\-]{1,8})", r"symbol/([A-Za-z.\-]{1,8})"]
-    for pat in pats:
-        m = re.search(pat, url)
-        if m:
-            s = m.group(1).upper()
-            if TICKER_RE.match(s):
-                return s
+def money(x, cur="USD"):
+    v = num(x)
+    if v is None:
+        return "غير متوفر"
+    a, sign = abs(v), "-" if v < 0 else ""
+    for div, s in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= div:
+            return f"{sign}{a / div:.2f}{s} {cur}"
+    return f"{sign}{a:,.2f} {cur}"
+
+
+def pct(a, b):
+    a, b = num(a), num(b)
+    if a is None or b in (None, 0):
+        return "—"
+    return f"{(a - b) / abs(b) * 100:+.1f}%"
+
+
+def get_row(df, names):
+    try:
+        if df is None or df.empty:
+            return None
+        for n in names:
+            if n in df.index:
+                s = df.loc[n].dropna()
+                if len(s):
+                    return s.sort_index(ascending=False)
+    except Exception:
+        pass
     return None
 
 
-def ticker_from_image(image_path):
-    ans = process_via_bridge("ما رمز السهم (Ticker) الظاهر في هذا الشارت؟ أجب بالرمز فقط بالأحرف الإنجليزية الكبيرة، "
-                             "وإن لم تجده اكتب NONE.", image_path)
-    s = (ans or "").strip().upper().split()[0] if ans and not is_err(ans) else ""
-    s = s.strip("$:.,")
-    return s if TICKER_RE.match(s) and s != "NONE" else None
+def find_symbol(text, strict):
+    t = (text or "").strip()
+    if "tradingview.com" in t.lower():
+        m = re.search(r"symbol=(?:[A-Za-z_]+(?:%3A|:))?([A-Za-z0-9\.\-]+)", t) or \
+            re.search(r"/symbols/(?:[A-Za-z_]+-)?([A-Za-z0-9\.]+)", t)
+        if m:
+            return norm_symbol(m.group(1))
+    m = re.search(r"\$([A-Za-z]{1,5}(?:[.\-][A-Za-z]{1,2})?)\b", t)
+    if m:
+        return norm_symbol(m.group(1))
+    tick = r"([A-Za-z]{1,5}(?:[.\-][A-Za-z]{1,2})?|\d{4}(?:\.SR)?)"
+    if strict:
+        m = re.fullmatch(tick, t)
+        if m and (m.group(1).isupper() or m.group(1)[0].isdigit()):
+            return norm_symbol(m.group(1))
+        return None
+    m = re.search(r"(?<![\w])" + tick + r"(?![\w])", t)
+    return norm_symbol(m.group(1)) if m else None
 
 
-# ============================================================
-# 7) توجيه الرسائل
-# ============================================================
+def norm_symbol(s):
+    s = s.upper()
+    if re.fullmatch(r"\d{4}", s):
+        return s + ".SR"
+    m = re.fullmatch(r"([A-Z]{1,5})\.([A-Z])", s)
+    return f"{m.group(1)}-{m.group(2)}" if m else s
 
-HELP = """🤖 الأوامر:
-- أي نص عادي ← ترجمة للعربية (أو بحث ويكيبيديا إذا تطلب الأمر)
-- /wiki أو /ويكي + موضوع ← البحث في ويكيبيديا
-- /ملخص + نص (أو بالرد على رسالة) ← تلخيص
-- رابط فيديو (يوتيوب/X/تيك توك...) ← تنزيل الفيديو والصوت + تفريغ مترجم
-- /فيديو رابط | /صوت رابط | /تفريغ رابط ← خدمة واحدة فقط
-- صورة شارت ← تحليل السهم (الرمز في الكابشن اختياري)
-- $AAPL أو /سهم AAPL أو رابط سهم (TradingView/Finviz/Yahoo...) ← تحليل السهم
-- رابط sec.gov أو /sec AAPL ← قراءة وتحليل الإفصاحات
-- ملف PDF/TXT/HTML ← تلخيص
-- ملف صوت/فيديو ← تفريغ وترجمة"""
 
+_SEC_MAP = {}
+
+
+def sec_cik(sym):
+    if not _SEC_MAP:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_HEADERS, timeout=30)
+        for v in r.json().values():
+            _SEC_MAP[v["ticker"].upper()] = str(v["cik_str"]).zfill(10)
+    return _SEC_MAP.get(sym.upper())
+
+
+def sec_recent(cik, days=180):
+    j = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=SEC_HEADERS, timeout=30).json()
+    r = j["filings"]["recent"]
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    items_list = r.get("items") or []
+    out = []
+    for i in range(len(r["form"])):
+        if r["filingDate"][i] < cutoff:
+            break
+        acc = r["accessionNumber"][i].replace("-", "")
+        out.append({
+            "form": r["form"][i],
+            "date": r["filingDate"][i],
+            "items": items_list[i] if i < len(items_list) else "",
+            "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{r['primaryDocument'][i]}",
+        })
+    return out
+
+
+ITEM_AR = {
+    "1.01": "اتفاقية/عقد جوهري", "1.02": "إنهاء اتفاقية", "2.02": "نتائج مالية",
+    "2.03": "التزام/دين جديد", "3.01": "إشعار إدراج (مخالفة/نقص امتثال)",
+    "3.02": "إصدار أسهم غير مسجّل (زيادة رأس المال)", "3.03": "تعديل حقوق المساهمين",
+    "5.02": "تغيير إداري", "5.03": "تعديل النظام الأساسي (قد يتضمن تقسيم/تغيير أسهم)",
+    "5.07": "نتائج تصويت المساهمين", "7.01": "إفصاح/عرض", "8.01": "حدث آخر",
+}
+CAP_PREFIX = ("S-1", "S-3", "F-1", "F-3", "424B", "S-11")
+
+
+def filing_label(f):
+    form = f["form"]
+    if form.startswith(CAP_PREFIX):
+        return f"{form} — تسجيل/طرح أوراق مالية (احتمال تخفيف)"
+    if form.startswith("8-K"):
+        labels = [ITEM_AR[i] for i in f["items"].split(",") if i in ITEM_AR]
+        return f"{form} — " + ("، ".join(labels) if labels else "إفصاح")
+    if form in ("DEF 14A", "PRE 14A"):
+        return f"{form} — بيان تفويض مساهمين (قد يتضمن زيادة أسهم/تقسيم عكسي)"
+    return form
+
+
+def filing_lines(fl, limit=5):
+    return [f"• {f['date']} — {filing_label(f)}\n  {f['url']}" for f in fl[:limit]]
+
+
+def filing_brief(url):
+    try:
+        r = requests.get(url, headers=SEC_HEADERS, timeout=30)
+        soup = BeautifulSoup(r.content, "lxml")
+        text = soup.get_text("\n")
+        text = text[text.find("Item"):] if "Item" in text else text
+        sents = split_sentences(text)[:3]
+        return translate_ar(" ".join(sents))[:450] if sents else ""
+    except Exception:
+        return ""
+
+
+def parse_dt(ts):
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        if isinstance(ts, str):
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+
+def get_news(t, sym):
+    items = []
+    try:
+        for n in (t.news or []):
+            c = n.get("content") or n
+            title = c.get("title")
+            if not title:
+                continue
+            link = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
+                    or c.get("link") or "")
+            pub = (c.get("provider") or {}).get("displayName") or c.get("publisher") or ""
+            items.append((parse_dt(c.get("pubDate") or c.get("providerPublishTime")), title, pub, link))
+    except Exception as e:  # noqa
+        log.warning("yf news: %s", e)
+    try:
+        r = requests.get(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={sym}&region=US&lang=en-US",
+                         headers=WEB_HEADERS, timeout=20)
+        for it in ET.fromstring(r.content).iter("item"):
+            title = (it.findtext("title") or "").strip()
+            if not title:
+                continue
+            try:
+                dt = parsedate_to_datetime(it.findtext("pubDate"))
+            except Exception:
+                dt = None
+            items.append((dt, title, "Yahoo Finance", (it.findtext("link") or "").strip()))
+    except Exception as e:  # noqa
+        log.warning("rss: %s", e)
+    seen, uniq = set(), []
+    for it in items:
+        k = it[1].lower()[:80]
+        if k not in seen:
+            seen.add(k)
+            uniq.append(it)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    uniq.sort(key=lambda x: x[0] or epoch, reverse=True)
+    return uniq
+
+
+NEWS_KW = re.compile(r"contract|agreement|award|order|partner|deal|project|collaborat|acquir|acquisition|"
+                     r"license|supply|FDA|approv|launch|grant|reverse split|offering|private placement", re.I)
+
+
+def analyze_stock(sym):
+    import yfinance as yf
+    t = yf.Ticker(sym)
+    hist = t.history(period="1y", interval="1d")
+    if hist is None or hist.empty:
+        return [f"❌ لم أجد بيانات للرمز {sym}. تأكد من الرمز (مثال: AAPL أو 2222 للسوق السعودي)."]
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+    cur = info.get("currency") or "USD"
+    name = info.get("longName") or info.get("shortName") or sym
+    c = hist["Close"].dropna()
+    price = num(c.iloc[-1])
+    now = datetime.now(timezone.utc)
+
+    # بيانات SEC (للأسهم الأمريكية)
+    filings, sec_note = [], ""
+    try:
+        cik = sec_cik(sym)
+        if cik:
+            filings = sec_recent(cik, 180)
+        else:
+            sec_note = "ℹ️ لا توجد بيانات SEC لهذا الرمز (سهم غير مدرج أمريكياً أو غير مسجّل)."
+    except Exception as e:  # noqa
+        sec_note = "ℹ️ تعذّر الوصول إلى SEC حالياً."
+        log.warning("sec: %s", e)
+
+    sections = []
+
+    # ── الترويسة
+    sections.append(
+        f"📊 {name} ({sym})\n"
+        f"السعر: {price:.2f} {cur} | القيمة السوقية: {money(info.get('marketCap'), cur)}\n"
+        f"البورصة: {info.get('exchange') or '—'} | الدولة: {info.get('country') or '—'}")
+
+    # ── 1) النشاط
+    try:
+        cat = " / ".join(x for x in (info.get("sector"), info.get("industry")) if x)
+        desc_sents = split_sentences(info.get("longBusinessSummary") or "")[:2]
+        tr = translate_lines([cat, " ".join(desc_sents)]) if (cat or desc_sents) else ["", ""]
+        sections.append("🏢 النشاط\n"
+                        f"• الأساسي: {tr[0] or 'غير متوفر'}\n"
+                        f"• الفرعي/التفاصيل: {tr[1] or 'غير متوفر'}")
+    except Exception as e:  # noqa
+        log.warning("activity: %s", e)
+
+    # ── 2) نتائج الربع
+    try:
+        qi = t.quarterly_income_stmt
+        rev = get_row(qi, ["Total Revenue", "Operating Revenue"])
+        ni = get_row(qi, ["Net Income", "Net Income Common Stockholders"])
+        eps = get_row(qi, ["Diluted EPS", "Basic EPS"])
+        lines = []
+        if rev is not None or ni is not None:
+            base = (rev if rev is not None else ni)
+            lines.append(f"آخر ربع مُعلن: {base.index[0].strftime('%Y-%m-%d')}")
+
+            def cmp(label, s, is_money=True):
+                v = s.iloc[0]
+                txt = f"• {label}: {money(v, cur) if is_money else f'{v:.2f}'}"
+                if len(s) > 1:
+                    txt += f" | عن الربع السابق {pct(v, s.iloc[1])}"
+                if len(s) > 4:
+                    txt += f" | عن نفس الربع العام الماضي {pct(v, s.iloc[4])}"
+                return txt
+            if rev is not None:
+                lines.append(cmp("الإيرادات", rev))
+            if ni is not None:
+                lines.append(cmp("صافي الربح/الخسارة", ni))
+            if eps is not None:
+                lines.append(cmp("ربحية السهم", eps, False))
+        else:
+            lines.append("لا تتوفر نتائج ربعية.")
+        try:
+            ed = t.get_earnings_dates(limit=6)
+            rep = ed[ed["Reported EPS"].notna()].iloc[0]
+            lines.append(f"• مفاجأة آخر نتائج: الفعلي {rep['Reported EPS']} مقابل المتوقع {rep['EPS Estimate']}")
+        except Exception:
+            pass
+        try:
+            nxt = (t.calendar or {}).get("Earnings Date")
+            if nxt:
+                lines.append(f"• موعد النتائج القادم: {nxt[0]}")
+        except Exception:
+            pass
+        sections.append("📈 نتائج الربع\n" + "\n".join(lines))
+    except Exception as e:  # noqa
+        log.warning("results: %s", e)
+
+    # ── 3) المستهدفات
+    try:
+        lines = []
+        tm = num(info.get("targetMeanPrice"))
+        if tm:
+            lines.append(f"• متوسط مستهدف المحللين: {tm:.2f} ({pct(tm, price)} عن السعر)")
+            lines.append(f"• الأعلى: {info.get('targetHighPrice')} | الأدنى: {info.get('targetLowPrice')} "
+                         f"| عدد المحللين: {info.get('numberOfAnalystOpinions')}")
+            if info.get("recommendationKey"):
+                lines.append(f"• التوصية العامة: {info['recommendationKey']}")
+        else:
+            lines.append("• لا توجد تغطية محللين (شائع في الأسهم الصغيرة).")
+        hi52, lo52 = num(hist["High"].max()), num(hist["Low"].min())
+        hi3m = num(hist["High"].tail(63).max())
+        lines.append(f"• مقاومات فنية: أعلى 3 أشهر {hi3m:.2f} | أعلى 52 أسبوع {hi52:.2f}")
+        lines.append(f"• أدنى 52 أسبوع: {lo52:.2f}")
+        sections.append("🎯 المستهدفات\n" + "\n".join(lines))
+    except Exception as e:  # noqa
+        log.warning("targets: %s", e)
+
+    # ── 4) المشاريع والعقود
+    news = get_news(t, sym)
+    try:
+        lines = []
+        contracts = [f for f in filings if f["form"].startswith("8-K") and "1.01" in f["items"]]
+        if contracts:
+            lines.append("عقود/اتفاقيات جوهرية (SEC آخر 6 أشهر):")
+            for f in contracts[:3]:
+                lines.append(f"• {f['date']} — {f['form']}\n  {f['url']}")
+            for f in contracts[:2]:
+                b = filing_brief(f["url"])
+                if b:
+                    lines.append(f"  ↳ {b}")
+        kw = [n for n in news if NEWS_KW.search(n[1]) and (not n[0] or now - n[0] < timedelta(days=45))][:4]
+        if kw:
+            lines.append("من العناوين الأخيرة (مشاريع/عقود/شراكات):")
+            for (dt, title, pub, link), ar in zip(kw, translate_lines([k[1] for k in kw])):
+                lines.append(f"• {ar}\n  {link}")
+        if not lines:
+            lines.append("لا توجد عقود أو مشاريع مُعلنة حديثاً في المصادر المتاحة.")
+        sections.append("🤝 المشاريع والعقود\n" + "\n".join(lines))
+    except Exception as e:  # noqa
+        log.warning("contracts: %s", e)
+
+    # ── 5) الاتجاه العام
+    try:
+        sma = {n: num(c.rolling(n).mean().iloc[-1]) for n in (20, 50, 200)}
+        above = [n for n, v in sma.items() if v and price > v]
+        valid = [n for n, v in sma.items() if v]
+        if valid and len(above) == len(valid):
+            trend = "صاعد 🟢 (فوق جميع المتوسطات)"
+        elif not above:
+            trend = "هابط 🔴 (تحت جميع المتوسطات)"
+        else:
+            trend = "مختلط/عرضي 🟡"
+        d = c.diff()
+        up, dn = d.clip(lower=0), -d.clip(upper=0)
+        rs = up.ewm(alpha=1 / 14, adjust=False).mean() / dn.ewm(alpha=1 / 14, adjust=False).mean()
+        rsi = num((100 - 100 / (1 + rs)).iloc[-1])
+
+        def chg(n):
+            return pct(price, c.iloc[-n - 1]) if len(c) > n else "—"
+        vol_avg = num(hist["Volume"].tail(30).mean())
+        vol_now = num(hist["Volume"].iloc[-1])
+        lines = [f"• الاتجاه: {trend}",
+                 "• المتوسطات: " + " | ".join(f"MA{n}: {v:.2f}" for n, v in sma.items() if v),
+                 f"• التغير: شهر {chg(21)} | 3 أشهر {chg(63)} | 6 أشهر {chg(126)}"]
+        if rsi is not None:
+            state = "تشبع شراء" if rsi > 70 else "تشبع بيع" if rsi < 30 else "محايد"
+            lines.append(f"• RSI(14): {rsi:.0f} ({state})")
+        if vol_avg and vol_now:
+            lines.append(f"• حجم آخر جلسة: {vol_now / vol_avg:.1f}× متوسط 30 يوم")
+        sections.append("🧭 الاتجاه العام\n" + "\n".join(lines))
+    except Exception as e:  # noqa
+        log.warning("trend: %s", e)
+
+    # ── 6) رأس المال / توزيعات / تقسيم عكسي
+    try:
+        lines = []
+        bs = t.quarterly_balance_sheet
+        if bs is None or bs.empty:
+            bs = t.balance_sheet
+        sh = get_row(bs, ["Ordinary Shares Number", "Share Issued"])
+        if sh is not None and len(sh) > 1:
+            old = sh.iloc[min(4, len(sh) - 1)]
+            ch = pct(sh.iloc[0], old)
+            lines.append(f"• الأسهم القائمة: {sh.iloc[0]:,.0f} (تغير {ch} خلال {min(4, len(sh) - 1)} أرباع)"
+                         + (" ⚠️ تخفيف ملحوظ" if (num(sh.iloc[0]) or 0) > (num(old) or 1) * 1.1 else ""))
+        elif info.get("sharesOutstanding"):
+            lines.append(f"• الأسهم القائمة: {info['sharesOutstanding']:,.0f}")
+        cap = [f for f in filings if f["form"].startswith(CAP_PREFIX)
+               or (f["form"].startswith("8-K") and "3.02" in f["items"])]
+        if cap:
+            lines.append("• طرح/زيادة رأس المال (SEC آخر 6 أشهر):")
+            lines += ["  " + l.replace("\n", "\n  ") for l in filing_lines(cap, 5)]
+        else:
+            lines.append("• لا توجد إيداعات طرح/زيادة رأس مال في آخر 6 أشهر." if filings else "• زيادة رأس المال: غير متاح.")
+        # التقسيم
+        try:
+            sp = t.splits
+            if sp is not None and len(sp):
+                tz = sp.index.tz
+                recent = sp[sp.index > (pd_now(tz) - timedelta(days=5 * 365))]
+                for dt, ratio in list(recent.items())[-3:]:
+                    r = float(ratio)
+                    desc = f"تقسيم عكسي 1:{round(1 / r)}" if r < 1 else f"تقسيم أسهم {round(r, 2)}:1"
+                    lines.append(f"• {dt.strftime('%Y-%m-%d')} — {desc}")
+            else:
+                lines.append("• لا يوجد تقسيم (عادي/عكسي) خلال 5 سنوات.")
+        except Exception:
+            pass
+        rs_f = [f for f in filings if (f["form"].startswith("8-K") and "5.03" in f["items"])
+                or f["form"] in ("DEF 14A", "PRE 14A")]
+        if rs_f:
+            lines.append("• إيداعات قد ترتبط بتقسيم عكسي/تعديل أسهم (تحقق من المستند):")
+            lines += ["  " + l.replace("\n", "\n  ") for l in filing_lines(rs_f, 3)]
+        rs_news = [n for n in news if re.search(r"reverse (stock )?split", n[1], re.I)][:2]
+        for n in rs_news:
+            lines.append(f"• خبر: {translate_ar(n[1])}\n  {n[3]}")
+        warn = [f for f in filings if f["form"].startswith("8-K") and "3.01" in f["items"]]
+        if warn:
+            lines.append("• ⚠️ إشعار إدراج/امتثال:")
+            lines += ["  " + l.replace("\n", "\n  ") for l in filing_lines(warn, 2)]
+        # التوزيعات
+        dv = t.dividends
+        if dv is not None and len(dv):
+            last = dv.iloc[-1]
+            lines.append(f"• آخر توزيع: {last:.4f} {cur} بتاريخ {dv.index[-1].strftime('%Y-%m-%d')}"
+                         + (f" | العائد {info['dividendYield']:.2f}%" if num(info.get("dividendYield")) else ""))
+        else:
+            lines.append("• لا توجد توزيعات أرباح.")
+        sections.append("🏦 رأس المال والتوزيعات والتقسيم\n" + "\n".join(lines))
+    except Exception as e:  # noqa
+        log.warning("capital: %s", e)
+
+    # ── 7) الخسائر المتراكمة
+    try:
+        bs = t.quarterly_balance_sheet
+        if bs is None or bs.empty:
+            bs = t.balance_sheet
+        re_ = get_row(bs, ["Retained Earnings"])
+        lines = []
+        if re_ is not None:
+            v = re_.iloc[0]
+            if v < 0:
+                lines.append(f"• نعم، لديها خسائر متراكمة بقيمة {money(abs(v), cur)} (بتاريخ {re_.index[0].strftime('%Y-%m-%d')})")
+            else:
+                lines.append(f"• لا، لديها أرباح محتجزة {money(v, cur)}")
+        else:
+            lines.append("• الأرباح المحتجزة غير متاحة في المصدر.")
+        qi = t.quarterly_income_stmt
+        ni = get_row(qi, ["Net Income", "Net Income Common Stockholders"])
+        if ni is not None and len(ni) >= 4:
+            lines.append(f"• صافي آخر 4 أرباع: {money(ni.iloc[:4].sum(), cur)}")
+        cash = get_row(bs, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
+        ocf = get_row(t.quarterly_cashflow, ["Operating Cash Flow"])
+        if cash is not None:
+            lines.append(f"• النقد المتاح: {money(cash.iloc[0], cur)}")
+            if ocf is not None and len(ocf) >= 4 and ocf.iloc[:4].sum() < 0:
+                monthly = -ocf.iloc[:4].sum() / 12
+                lines.append(f"• حرق نقدي ≈ {money(monthly, cur)}/شهر → يكفي نحو {cash.iloc[0] / monthly:.1f} شهر")
+        sections.append("📉 الخسائر المتراكمة\n" + "\n".join(lines))
+    except Exception as e:  # noqa
+        log.warning("deficit: %s", e)
+
+    # ── 8) الأخبار
+    try:
+        today = [n for n in news if n[0] and now - n[0] < timedelta(hours=24)][:6]
+        shown, title = (today, "📰 أخبار اليوم") if today else (news[:6], "📰 آخر الأخبار المتاحة (لا أخبار خلال 24 ساعة)")
+        if shown:
+            ar = translate_lines([n[1] for n in shown])
+            body = []
+            for (dt, _, pub, link), a in zip(shown, ar):
+                stamp = dt.strftime("%m-%d %H:%M UTC") if dt else ""
+                body.append(f"• {a}\n  {pub} {stamp}\n  {link}")
+            sections.append(title + "\n" + "\n".join(body))
+        else:
+            sections.append("📰 الأخبار\n• لا توجد أخبار متاحة.")
+    except Exception as e:  # noqa
+        log.warning("news: %s", e)
+
+    if sec_note:
+        sections.append(sec_note)
+    sections.append("⚠️ المعلومات للاطلاع فقط وليست توصية بيع أو شراء.")
+    return ["\n\n".join(sections)]
+
+
+def pd_now(tz):
+    import pandas as pd
+    return pd.Timestamp.now(tz=tz) if tz else pd.Timestamp.now()
+
+
+# ──────────────────────────── توجيه الرسائل ────────────────────────────
+CMD_ALIAS = {"tr": "tr", "translate": "tr", "sum": "sum", "summary": "sum", "summarize": "sum",
+             "stock": "stock", "s": "stock", "analyze": "stock", "start": "help", "help": "help"}
+AR_RE = re.compile(r"^(تلخيص|لخص|ترجمة|ترجم|تحليل|حلل)(?:\s+|$)(.*)", re.S)
+AR_MAP = {"تلخيص": "sum", "لخص": "sum", "ترجمة": "tr", "ترجم": "tr", "تحليل": "stock", "حلل": "stock"}
 URL_RE = re.compile(r"https?://\S+")
 
 
-def is_media_url(u):
-    h = (urlparse(u).hostname or "").lower()
-    return any(h == d or h.endswith("." + d) for d in MEDIA_DOMAINS)
+def parse_intent(text):
+    t = (text or "").strip()
+    if t.startswith("/"):
+        parts = t.split(None, 1)
+        cmd = CMD_ALIAS.get(parts[0][1:].split("@")[0].lower())
+        return cmd, (parts[1] if len(parts) > 1 else "")
+    m = AR_RE.match(t)
+    if m:
+        return AR_MAP[m.group(1)], m.group(2).strip()
+    return None, t
 
 
-STOCK_HOSTS = ("tradingview.com", "finviz.com", "finance.yahoo.com", "stocktwits.com", "nasdaq.com",
-               "google.com", "webull.com", "marketwatch.com", "investing.com")
+def media_of(m):
+    if not m:
+        return None
+    if m.get("document"):
+        d = m["document"]
+        return d["file_id"], d.get("file_name") or "file.bin"
+    if m.get("photo"):
+        return m["photo"][-1]["file_id"], "photo.jpg"
+    return None
 
 
-def is_stock_url(u):
-    h = (urlparse(u).hostname or "").lower()
-    return any(h == d or h.endswith("." + d) for d in STOCK_HOSTS)
-
-
-def handle_text(chat_id, mid, text, reply_text=None):
-    t = text.strip()
-    low = t.lower()
-    cmd, _, rest = t.partition(" ")
-    cmd = cmd.lower()
-    rest = rest.strip()
-
-    if cmd in ("/start", "/help", "/مساعدة"):
-        send_message(chat_id, HELP, mid)
-        return
-
-    if cmd in ("/wiki", "/ويكي"):
-        if rest:
-            # توجيه الطلب خصيصاً لمتصفح ويكيبيديا عبر الجسر أو الدالة
-            if _BROWSER:
-                res = _BROWSER._ask_wiki(rest)
-                send_long(chat_id, res, mid)
-            else:
-                send_message(chat_id, "⚠️ متصفح ويكيبيديا غير جاهز بعد.", mid)
-        else:
-            send_message(chat_id, "⚠️ أضف الكلمة المراد البحث عنها بعد الأمر، مثال: `/wiki الذكاء الاصطناعي`", mid)
-        return
-
-    url_m = URL_RE.search(t)
-    url = url_m.group(0) if url_m else None
-
-    if cmd in ("/فيديو", "/صوت", "/تفريغ") and url:
-        media_flow(chat_id, mid, url, {"/فيديو": "video", "/صوت": "audio", "/تفريغ": "transcript"}[cmd])
-        return
-
-    if cmd in ("/sec", "/سيك"):
-        if url:
-            send_long(chat_id, analyze_sec_text(fetch_url_text(url)), mid)
-        else:
-            sym = rest.upper().lstrip("$")
-            blk = sec_context(sym)
-            send_long(chat_id, process_via_bridge(SEC_PROMPT + "\nهذه إفصاحات الشركة:\n" + blk), mid)
-        return
-
-    if cmd in ("/سهم", "/stock"):
-        sym = rest.upper().lstrip("$") or None
-        if url and not sym:
-            sym = ticker_from_url(url)
-        send_long(chat_id, analyze_stock(sym), mid)
-        return
-
-    if cmd in ("/ملخص", "/sum", "/لخص"):
-        src = rest or reply_text or ""
-        if url and not rest.replace(url, "").strip():
-            src = fetch_url_text(url)
-        if not src:
-            send_message(chat_id, "⚠️ أرسل النص أو رد على رسالة لتلخيصها.", mid)
-            return
-        send_long(chat_id, summarize_text(src), mid)
-        return
-
-    if url and is_media_url(url):
-        media_flow(chat_id, mid, url, "all")
-        return
-
-    if url and ("sec.gov" in url or is_stock_url(url)):
-        if "sec.gov" in url:
-            send_long(chat_id, analyze_sec_text(fetch_url_text(url)), mid)
-        else:
-            sym = ticker_from_url(url)
-            send_long(chat_id, analyze_stock(sym), mid)
-        return
-
-    if t.startswith("$") and TICKER_RE.match(t.upper().lstrip("$")):
-        send_long(chat_id, analyze_stock(t.upper().lstrip("$")), mid)
-        return
-
-    # المعالجة الافتراضية للنص العادي
-    if is_arabic(t):
-        send_long(chat_id, process_via_bridge(f"أجب عن التالي بدقة واحترافية:\n\n{t}"), mid)
+def deliver_translation(chat_id, text, title):
+    if len(text) > 120000:
+        text = text[:120000]
+        send(chat_id, "ℹ️ النص طويل جداً، تمت ترجمة أول 120 ألف حرف فقط.")
+    out = translate_ar(text)
+    if len(out) <= 3500:
+        send(chat_id, out)
     else:
-        send_long(chat_id, translate_to_arabic(t), mid)
+        send_doc(chat_id, out, "translation_ar.txt", caption=f"🌐 الترجمة الكاملة: {title}")
 
 
-def handle_document(chat_id, mid, file_id, name, caption):
-    wd = tempfile.mkdtemp(prefix="doc_")
-    try:
-        p = tg_download(file_id, wd, name)
-        if not p:
-            send_message(chat_id, "❌ تعذر تنزيل الملف.", mid)
-            return
-        ext = os.path.splitext(p)[1].lower()
-        if ext in (".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".mkv"):
-            if ext in (".mp4", ".mkv"):
-                aud = os.path.join(wd, "extracted.mp3")
-                _run(["ffmpeg", "-i", p, "-q:a", "2", "-map", "a", aud])
-                if os.path.exists(aud):
-                    p = aud
-            transcript_flow(chat_id, mid, p)
-            return
-        txt = ""
-        if ext == ".pdf":
-            txt = pdf_to_text(p)
-        elif ext in (".txt", ".html", ".htm", ".csv", ".json"):
-            with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                txt = f.read()
-        else:
-            txt = f"ملف مرفق: {name}"
-        if caption:
-            txt = f"ملاحظة المستخدم: {caption}\n\n" + txt
-        if "sec" in name.lower() or "10-k" in name.lower() or "10-q" in name.lower():
-            send_long(chat_id, analyze_sec_text(txt), mid)
-        else:
-            send_long(chat_id, summarize_text(txt), mid)
-    finally:
-        shutil.rmtree(wd, ignore_errors=True)
-
-
-def handle_photo(chat_id, mid, photo_list, caption):
-    best = max(photo_list, key=lambda x: x.get("file_size", 0))
-    wd = tempfile.mkdtemp(prefix="photo_")
-    try:
-        p = tg_download(best["file_id"], wd, "chart.jpg")
-        if not p:
-            send_message(chat_id, "❌ تعذر تنزيل الصورة.", mid)
-            return
-        sym = (caption or "").upper().lstrip("$").strip()
-        if not TICKER_RE.match(sym):
-            sym = ticker_from_image(p)
-        send_long(chat_id, analyze_stock(sym, p), mid)
-    finally:
-        shutil.rmtree(wd, ignore_errors=True)
-
-
-# ============================================================
-# 8) حلقة الاستطلاع (Polling) الرئيسية لتلغرام
-# ============================================================
-
-
-def telegram_polling():
-    offset = 0
-    print("🤖 البوت يعمل ويستطلع رسائل تلغرام...")
-    start_time = time.time()
-    while time.time() - start_time < RUN_SECONDS:
-        try:
-            r = requests.get(f"{API}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=45)
-            data = r.json()
-            if not data.get("ok"):
-                time.sleep(3)
-                continue
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg:
-                    continue
-                cid = str(msg.get("chat", {}).get("id", ""))
-                if CHAT_ID and cid != CHAT_ID:
-                    continue  # حماية: الرد فقط على الشات المخصص
-                mid = msg.get("message_id")
-                txt = msg.get("text") or msg.get("caption") or ""
-                reply_to = msg.get("reply_to_message", {})
-                reply_text = reply_to.get("text") or reply_to.get("caption")
-
-                if "photo" in msg:
-                    threading.Thread(target=handle_photo, args=(cid, mid, msg["photo"], txt), daemon=True).start()
-                elif "document" in msg:
-                    d = msg["document"]
-                    threading.Thread(target=handle_document, args=(cid, mid, d["file_id"], d.get("file_name", "file"), txt), daemon=True).start()
-                elif "audio" in msg or "voice" in msg:
-                    audio_obj = msg.get("audio") or msg.get("voice")
-                    threading.Thread(target=handle_document, args=(cid, mid, audio_obj["file_id"], audio_obj.get("file_name", "audio.ogg"), txt), daemon=True).start()
-                elif "video" in msg or "video_note" in msg:
-                    v_obj = msg.get("video") or msg.get("video_note")
-                    threading.Thread(target=handle_document, args=(cid, mid, v_obj["file_id"], v_obj.get("file_name", "video.mp4"), txt), daemon=True).start()
-                elif txt:
-                    threading.Thread(target=handle_text, args=(cid, mid, txt, reply_text), daemon=True).start()
-        except Exception as e:
-            print("Polling error:", e)
-            time.sleep(5)
-
-
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "login":
-        login_mode()
+def handle(msg):
+    chat_id = msg["chat"]["id"]
+    if str(chat_id) != CHAT_ID:
         return
-    if not BOT_TOKEN:
-        print("خطأ: BOT_TOKEN غير موجود.")
-        sys.exit(1)
-    if not start_bridge():
-        print("خطأ في تشغيل جسر المتصفح.")
-        sys.exit(1)
-    telegram_polling()
+    mid = msg.get("message_id")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    cmd, arg = parse_intent(text)
+    reply = msg.get("reply_to_message") or {}
+    reply_text = (reply.get("text") or reply.get("caption") or "").strip()
+
+    if cmd == "help" or (not text and not media_of(msg) and not media_of(reply)):
+        send(chat_id, HELP)
+        return
+
+    media = media_of(msg) or (media_of(reply) if cmd in ("tr", "sum") and not arg else None)
+
+    # ─ تحليل سهم
+    if not media:
+        sym = None
+        if cmd == "stock":
+            sym = find_symbol(arg or reply_text, strict=False)
+        elif cmd is None:
+            sym = find_symbol(text, strict=True)
+        if cmd == "stock" and not sym:
+            send(chat_id, "اكتب رمز السهم، مثال: /stock AAPL أو تحليل 2222")
+            return
+        if sym:
+            send(chat_id, f"⏳ جاري تحليل {sym} ... (قد يستغرق دقيقة)", reply_to=mid)
+            for part in analyze_stock(sym):
+                send(chat_id, part)
+            return
+
+    typing(chat_id)
+
+    # ─ جمع المحتوى
+    title, content = "النص", ""
+    if media:
+        file_id, fname = media
+        send(chat_id, f"⏳ جاري قراءة «{fname}» ...", reply_to=mid)
+        content = extract_text(download_file(file_id), fname)
+        title = fname
+        action = cmd or ("tr" if fname == "photo.jpg" else "sum")
+    else:
+        src = arg or reply_text
+        m = URL_RE.search(src)
+        if m and len(src.strip()) < len(m.group(0)) + 20:
+            send(chat_id, "⏳ جاري قراءة الرابط ...", reply_to=mid)
+            title, content = fetch_article(m.group(0))
+            action = cmd or "sum"
+        else:
+            content = src
+            action = cmd or "tr"
+
+    if len(content.strip()) < 2:
+        send(chat_id, "⚠️ لم أجد نصاً لمعالجته.")
+        return
+    if action == "sum" and len(content) < 400:
+        action = "tr"  # النص قصير: الأفضل ترجمته
+    if action == "sum":
+        content = content[:600000]
+        send(chat_id, build_summary(content, title))
+    else:
+        deliver_translation(chat_id, content, title)
+
+
+# ──────────────────────────── الحلقة الرئيسية ────────────────────────────
+def main():
+    log.info("Bot started. Running for %s seconds", RUN_SECONDS)
+    deadline = time.time() + RUN_SECONDS
+    offset = None
+    while time.time() < deadline:
+        try:
+            r = requests.post(f"{API}/getUpdates", timeout=40, data={
+                k: v for k, v in {"offset": offset, "timeout": 25,
+                                  "allowed_updates": '["message"]'}.items() if v is not None})
+            updates = r.json().get("result", [])
+        except Exception as e:  # noqa
+            log.warning("getUpdates: %s", e)
+            time.sleep(5)
+            continue
+        for u in updates:
+            offset = u["update_id"] + 1
+            msg = u.get("message")
+            if not msg:
+                continue
+            try:
+                handle(msg)
+            except Exception as e:  # noqa
+                log.exception("handle error")
+                if str(msg["chat"]["id"]) == CHAT_ID:
+                    send(msg["chat"]["id"], f"⚠️ حدث خطأ: {str(e)[:300]}")
+    log.info("Run window finished, exiting (the workflow will restart).")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
