@@ -141,40 +141,73 @@ def chunk_text(text, limit=4000):
     return chunks
 
 
+# ── حد معدل طلبات الترجمة (Google يسمح ≈ 5/ثانية)
+_last_gtx = 0.0
+_GTX_MIN_GAP = 0.35  # ثانية بين كل طلب
+
+
+def _gtx_wait():
+    global _last_gtx
+    gap = time.time() - _last_gtx
+    if gap < _GTX_MIN_GAP:
+        time.sleep(_GTX_MIN_GAP - gap)
+    _last_gtx = time.time()
+
+
+def _is_rate_limit(err):
+    s = str(err).lower()
+    return any(k in s for k in ("too many requests", "429", "rate", "quota", "5 requests per second"))
+
+
 def _gtx(chunk, sl):
+    _gtx_wait()
     r = requests.post(
         "https://translate.googleapis.com/translate_a/single",
         params={"client": "gtx", "sl": sl, "tl": "ar", "dt": "t"},
         data={"q": chunk}, headers=WEB_HEADERS, timeout=30)
+    if r.status_code == 429:
+        raise RuntimeError(f"429 rate limit: {r.text[:200]}")
     r.raise_for_status()
     data = r.json()
     return "".join(x[0] for x in data[0] if x and x[0])
 
 
-def _translate_chunk(chunk):
+def _translate_chunk(chunk, soft=False):
+    """soft=True: عند الفشل يرجع النص الأصلي بدل رفع خطأ."""
     if not chunk.strip():
         return chunk
     needs = bool(re.search(r"[^\W\d_]", chunk)) and not is_arabic(chunk, 0.9)
     has_latin = bool(re.search(r"[A-Za-z]{3}", chunk))
     best, last_err = None, None
+
+    # محاولة واحدة بـ auto أولاً؛ en فقط إذا فشلت أو النتيجة غير عربية
     for sl in ("auto", "en"):
         out = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 out = _gtx(chunk, sl)
                 break
             except Exception as e:  # noqa
                 last_err = e
-                log.warning("gtx %s: %s", sl, e)
-                time.sleep(1.5 * (attempt + 1))
+                log.warning("gtx %s attempt %s: %s", sl, attempt + 1, e)
+                if _is_rate_limit(e):
+                    time.sleep(3 * (attempt + 1))  # 3، 6، 9، 12 ثانية
+                else:
+                    time.sleep(1.2 * (attempt + 1))
         if out and out.strip() and (out.strip() != chunk.strip() or not needs):
             best = out
             if is_arabic(out, 0.6) or not has_latin:
                 return out
+        if best:
+            break  # لا نجرب en إذا حصلنا نتيجة مقبولة من auto
+
     if best:
         return best
-    try:  # احتياطي ثانٍ
+
+    # احتياطي: deep_translator
+    try:
         from deep_translator import GoogleTranslator
+        time.sleep(1.5)
         for sl in ("auto", "en"):
             out = GoogleTranslator(source=sl, target="ar").translate(chunk)
             if out and out.strip() != chunk.strip():
@@ -182,14 +215,27 @@ def _translate_chunk(chunk):
     except Exception as e:  # noqa
         last_err = e
         log.warning("deep_translator: %s", e)
-    raise RuntimeError(f"فشلت الترجمة (Google لم يُرجع ترجمة). {last_err or ''}"[:250])
+
+    if soft:
+        log.warning("translate soft-fail, returning original. last_err=%s", last_err)
+        return chunk
+    raise RuntimeError(
+        f"فشلت الترجمة مؤقتاً (حد طلبات Google). انتظر دقيقة ثم أعد المحاولة. "
+        f"{str(last_err or '')[:120]}"
+    )
 
 
 def translate_ar(text):
     text = (text or "").strip()
     if not text or is_arabic(text, 0.9):
         return text
-    return "\n".join(_translate_chunk(c) for c in chunk_text(text, 1800))
+    parts = []
+    chunks = chunk_text(text, 1500)  # قطع أصغر = أقل ضغط
+    for i, c in enumerate(chunks):
+        if i > 0:
+            time.sleep(0.4)
+        parts.append(_translate_chunk(c, soft=True))
+    return "\n".join(parts)
 
 
 def translate_lines(lines):
@@ -200,13 +246,15 @@ def translate_lines(lines):
     def flush():
         if not group:
             return
-        out = _translate_chunk("\n".join(group)).split("\n")
+        joined = "\n".join(group)
+        out = _translate_chunk(joined, soft=True).split("\n")
         if len(out) == len(group):
             for i, o in zip(idx, out):
                 result[i] = o.strip()
         else:
             for i, g in zip(idx, group):
-                result[i] = _translate_chunk(g).strip()
+                time.sleep(0.3)
+                result[i] = _translate_chunk(g, soft=True).strip()
         group.clear()
         idx.clear()
 
@@ -215,9 +263,10 @@ def translate_lines(lines):
         if not l or is_arabic(l, 0.9):
             result[i] = l
             continue
-        if size + len(l) > 3500:
+        if size + len(l) > 2800:
             flush()
             size = 0
+            time.sleep(0.5)
         group.append(l.replace("\n", " "))
         idx.append(i)
         size += len(l) + 1
@@ -491,11 +540,18 @@ def sec_recent(cik, days=180):
 
 
 ITEM_AR = {
-    "1.01": "اتفاقية/عقد جوهري", "1.02": "إنهاء اتفاقية", "2.02": "نتائج مالية",
-    "2.03": "التزام/دين جديد", "3.01": "إشعار إدراج (مخالفة/نقص امتثال)",
-    "3.02": "إصدار أسهم غير مسجّل (زيادة رأس المال)", "3.03": "تعديل حقوق المساهمين",
-    "5.02": "تغيير إداري", "5.03": "تعديل النظام الأساسي (قد يتضمن تقسيم/تغيير أسهم)",
-    "5.07": "نتائج تصويت المساهمين", "7.01": "إفصاح/عرض", "8.01": "حدث آخر",
+    "1.01": "اتفاقية / عقد جوهري",
+    "1.02": "إنهاء اتفاقية",
+    "2.02": "نتائج مالية",
+    "2.03": "التزام / دين جديد",
+    "3.01": "إشعار إدراج (مخالفة / نقص امتثال)",
+    "3.02": "إصدار أسهم غير مسجّل (زيادة رأس المال)",
+    "3.03": "تعديل حقوق المساهمين",
+    "5.02": "تغيير إداري",
+    "5.03": "تعديل النظام الأساسي (قد يتضمن تقسيم أو تغيير أسهم)",
+    "5.07": "نتائج تصويت المساهمين",
+    "7.01": "إفصاح / عرض",
+    "8.01": "حدث آخر",
 }
 CAP_PREFIX = ("S-1", "S-3", "F-1", "F-3", "424B", "S-11")
 
@@ -503,12 +559,12 @@ CAP_PREFIX = ("S-1", "S-3", "F-1", "F-3", "424B", "S-11")
 def filing_label(f):
     form = f["form"]
     if form.startswith(CAP_PREFIX):
-        return f"{form} — تسجيل/طرح أوراق مالية (احتمال تخفيف)"
+        return f"{form} — تسجيل / طرح أوراق مالية (احتمال تخفيف)"
     if form.startswith("8-K"):
         labels = [ITEM_AR[i] for i in f["items"].split(",") if i in ITEM_AR]
         return f"{form} — " + ("، ".join(labels) if labels else "إفصاح")
     if form in ("DEF 14A", "PRE 14A"):
-        return f"{form} — بيان تفويض مساهمين (قد يتضمن زيادة أسهم/تقسيم عكسي)"
+        return f"{form} — بيان تفويض مساهمين (قد يتضمن زيادة أسهم أو تقسيم عكسي)"
     return form
 
 
@@ -615,17 +671,24 @@ def analyze_stock(sym):
     # ── الترويسة
     sections.append(
         f"📊 {name} ({sym})\n"
-        f"السعر: {price:.2f} {cur} | القيمة السوقية: {money(info.get('marketCap'), cur)}\n"
-        f"البورصة: {info.get('exchange') or '—'} | الدولة: {info.get('country') or '—'}")
+        f"السعر الحالي: {price:.2f} {cur}\n"
+        f"القيمة السوقية: {money(info.get('marketCap'), cur)}\n"
+        f"البورصة: {info.get('exchange') or '—'}  ·  الدولة: {info.get('country') or '—'}"
+    )
 
     # ── 1) النشاط
     try:
         cat = " / ".join(x for x in (info.get("sector"), info.get("industry")) if x)
         desc_sents = split_sentences(info.get("longBusinessSummary") or "")[:2]
         tr = translate_lines([cat, " ".join(desc_sents)]) if (cat or desc_sents) else ["", ""]
-        sections.append("🏢 النشاط\n"
-                        f"• الأساسي: {tr[0] or 'غير متوفر'}\n"
-                        f"• الفرعي/التفاصيل: {tr[1] or 'غير متوفر'}")
+        lines = []
+        if tr[0]:
+            lines.append(f"• القطاع: {tr[0]}")
+        if tr[1]:
+            lines.append(f"• نبذة: {tr[1]}")
+        if not lines:
+            lines.append("• لا تتوفر بيانات النشاط.")
+        sections.append("🏢 النشاط\n" + "\n".join(lines))
     except Exception as e:  # noqa
         log.warning("activity: %s", e)
 
@@ -638,28 +701,28 @@ def analyze_stock(sym):
         lines = []
         if rev is not None or ni is not None:
             base = (rev if rev is not None else ni)
-            lines.append(f"آخر ربع مُعلن: {base.index[0].strftime('%Y-%m-%d')}")
+            lines.append(f"آخر ربع معلن: {base.index[0].strftime('%Y-%m-%d')}")
 
             def cmp(label, s, is_money=True):
                 v = s.iloc[0]
                 txt = f"• {label}: {money(v, cur) if is_money else f'{v:.2f}'}"
                 if len(s) > 1:
-                    txt += f" | عن الربع السابق {pct(v, s.iloc[1])}"
+                    txt += f"  (ربع سابق {pct(v, s.iloc[1])})"
                 if len(s) > 4:
-                    txt += f" | عن نفس الربع العام الماضي {pct(v, s.iloc[4])}"
+                    txt += f"  (نفس الربع العام الماضي {pct(v, s.iloc[4])})"
                 return txt
             if rev is not None:
                 lines.append(cmp("الإيرادات", rev))
             if ni is not None:
-                lines.append(cmp("صافي الربح/الخسارة", ni))
+                lines.append(cmp("صافي الربح / الخسارة", ni))
             if eps is not None:
                 lines.append(cmp("ربحية السهم", eps, False))
         else:
-            lines.append("لا تتوفر نتائج ربعية.")
+            lines.append("• لا تتوفر نتائج ربعية.")
         try:
             ed = t.get_earnings_dates(limit=6)
             rep = ed[ed["Reported EPS"].notna()].iloc[0]
-            lines.append(f"• مفاجأة آخر نتائج: الفعلي {rep['Reported EPS']} مقابل المتوقع {rep['EPS Estimate']}")
+            lines.append(f"• مفاجأة النتائج: الفعلي {rep['Reported EPS']} مقابل المتوقع {rep['EPS Estimate']}")
         except Exception:
             pass
         try:
@@ -677,18 +740,18 @@ def analyze_stock(sym):
         lines = []
         tm = num(info.get("targetMeanPrice"))
         if tm:
-            lines.append(f"• متوسط مستهدف المحللين: {tm:.2f} ({pct(tm, price)} عن السعر)")
-            lines.append(f"• الأعلى: {info.get('targetHighPrice')} | الأدنى: {info.get('targetLowPrice')} "
-                         f"| عدد المحللين: {info.get('numberOfAnalystOpinions')}")
+            lines.append(f"• متوسط مستهدف المحللين: {tm:.2f}  ({pct(tm, price)} عن السعر الحالي)")
+            lines.append(f"• أعلى مستهدف: {info.get('targetHighPrice')}  ·  أدنى: {info.get('targetLowPrice')}"
+                         f"  ·  عدد المحللين: {info.get('numberOfAnalystOpinions')}")
             if info.get("recommendationKey"):
                 lines.append(f"• التوصية العامة: {info['recommendationKey']}")
         else:
             lines.append("• لا توجد تغطية محللين (شائع في الأسهم الصغيرة).")
         hi52, lo52 = num(hist["High"].max()), num(hist["Low"].min())
         hi3m = num(hist["High"].tail(63).max())
-        lines.append(f"• مقاومات فنية: أعلى 3 أشهر {hi3m:.2f} | أعلى 52 أسبوع {hi52:.2f}")
+        lines.append(f"• أعلى 3 أشهر: {hi3m:.2f}  ·  أعلى 52 أسبوع: {hi52:.2f}")
         lines.append(f"• أدنى 52 أسبوع: {lo52:.2f}")
-        sections.append("🎯 المستهدفات\n" + "\n".join(lines))
+        sections.append("🎯 المستهدفات والمقاومات\n" + "\n".join(lines))
     except Exception as e:  # noqa
         log.warning("targets: %s", e)
 
@@ -698,7 +761,7 @@ def analyze_stock(sym):
         lines = []
         contracts = [f for f in filings if f["form"].startswith("8-K") and "1.01" in f["items"]]
         if contracts:
-            lines.append("عقود/اتفاقيات جوهرية (SEC آخر 6 أشهر):")
+            lines.append("عقود واتفاقيات جوهرية (SEC — آخر 6 أشهر):")
             for f in contracts[:3]:
                 lines.append(f"• {f['date']} — {f['form']}\n  {f['url']}")
             for f in contracts[:2]:
@@ -707,11 +770,13 @@ def analyze_stock(sym):
                     lines.append(f"  ↳ {b}")
         kw = [n for n in news if NEWS_KW.search(n[1]) and (not n[0] or now - n[0] < timedelta(days=45))][:4]
         if kw:
-            lines.append("من العناوين الأخيرة (مشاريع/عقود/شراكات):")
+            if lines:
+                lines.append("")
+            lines.append("من العناوين الأخيرة (مشاريع / عقود / شراكات):")
             for (dt, title, pub, link), ar in zip(kw, translate_lines([k[1] for k in kw])):
                 lines.append(f"• {ar}\n  {link}")
         if not lines:
-            lines.append("لا توجد عقود أو مشاريع مُعلنة حديثاً في المصادر المتاحة.")
+            lines.append("• لا توجد عقود أو مشاريع معلنة حديثاً في المصادر المتاحة.")
         sections.append("🤝 المشاريع والعقود\n" + "\n".join(lines))
     except Exception as e:  # noqa
         log.warning("contracts: %s", e)
@@ -722,11 +787,11 @@ def analyze_stock(sym):
         above = [n for n, v in sma.items() if v and price > v]
         valid = [n for n, v in sma.items() if v]
         if valid and len(above) == len(valid):
-            trend = "صاعد 🟢 (فوق جميع المتوسطات)"
+            trend = "صاعد 🟢  (فوق جميع المتوسطات)"
         elif not above:
-            trend = "هابط 🔴 (تحت جميع المتوسطات)"
+            trend = "هابط 🔴  (تحت جميع المتوسطات)"
         else:
-            trend = "مختلط/عرضي 🟡"
+            trend = "مختلط / عرضي 🟡"
         d = c.diff()
         up, dn = d.clip(lower=0), -d.clip(upper=0)
         rs = up.ewm(alpha=1 / 14, adjust=False).mean() / dn.ewm(alpha=1 / 14, adjust=False).mean()
@@ -736,14 +801,16 @@ def analyze_stock(sym):
             return pct(price, c.iloc[-n - 1]) if len(c) > n else "—"
         vol_avg = num(hist["Volume"].tail(30).mean())
         vol_now = num(hist["Volume"].iloc[-1])
-        lines = [f"• الاتجاه: {trend}",
-                 "• المتوسطات: " + " | ".join(f"MA{n}: {v:.2f}" for n, v in sma.items() if v),
-                 f"• التغير: شهر {chg(21)} | 3 أشهر {chg(63)} | 6 أشهر {chg(126)}"]
+        lines = [
+            f"• الاتجاه: {trend}",
+            "• المتوسطات: " + "  ·  ".join(f"MA{n}: {v:.2f}" for n, v in sma.items() if v),
+            f"• التغير: شهر {chg(21)}  ·  3 أشهر {chg(63)}  ·  6 أشهر {chg(126)}",
+        ]
         if rsi is not None:
             state = "تشبع شراء" if rsi > 70 else "تشبع بيع" if rsi < 30 else "محايد"
-            lines.append(f"• RSI(14): {rsi:.0f} ({state})")
+            lines.append(f"• RSI(14): {rsi:.0f}  ({state})")
         if vol_avg and vol_now:
-            lines.append(f"• حجم آخر جلسة: {vol_now / vol_avg:.1f}× متوسط 30 يوم")
+            lines.append(f"• حجم آخر جلسة: {vol_now / vol_avg:.1f}× متوسط 30 يوماً")
         sections.append("🧭 الاتجاه العام\n" + "\n".join(lines))
     except Exception as e:  # noqa
         log.warning("trend: %s", e)
@@ -758,17 +825,17 @@ def analyze_stock(sym):
         if sh is not None and len(sh) > 1:
             old = sh.iloc[min(4, len(sh) - 1)]
             ch = pct(sh.iloc[0], old)
-            lines.append(f"• الأسهم القائمة: {sh.iloc[0]:,.0f} (تغير {ch} خلال {min(4, len(sh) - 1)} أرباع)"
-                         + (" ⚠️ تخفيف ملحوظ" if (num(sh.iloc[0]) or 0) > (num(old) or 1) * 1.1 else ""))
+            dil = "  ⚠️ تخفيف ملحوظ" if (num(sh.iloc[0]) or 0) > (num(old) or 1) * 1.1 else ""
+            lines.append(f"• الأسهم القائمة: {sh.iloc[0]:,.0f}  (تغير {ch} خلال {min(4, len(sh) - 1)} أرباع){dil}")
         elif info.get("sharesOutstanding"):
             lines.append(f"• الأسهم القائمة: {info['sharesOutstanding']:,.0f}")
         cap = [f for f in filings if f["form"].startswith(CAP_PREFIX)
                or (f["form"].startswith("8-K") and "3.02" in f["items"])]
         if cap:
-            lines.append("• طرح/زيادة رأس المال (SEC آخر 6 أشهر):")
+            lines.append("• طروحات / زيادة رأس مال (SEC — آخر 6 أشهر):")
             lines += ["  " + l.replace("\n", "\n  ") for l in filing_lines(cap, 5)]
         else:
-            lines.append("• لا توجد إيداعات طرح/زيادة رأس مال في آخر 6 أشهر." if filings else "• زيادة رأس المال: غير متاح.")
+            lines.append("• لا توجد إيداعات طرح أو زيادة رأس مال في آخر 6 أشهر." if filings else "• زيادة رأس المال: غير متاح.")
         # التقسيم
         try:
             sp = t.splits
@@ -780,34 +847,34 @@ def analyze_stock(sym):
                     desc = f"تقسيم عكسي 1:{round(1 / r)}" if r < 1 else f"تقسيم أسهم {round(r, 2)}:1"
                     lines.append(f"• {dt.strftime('%Y-%m-%d')} — {desc}")
             else:
-                lines.append("• لا يوجد تقسيم (عادي/عكسي) خلال 5 سنوات.")
+                lines.append("• لا يوجد تقسيم (عادي أو عكسي) خلال 5 سنوات.")
         except Exception:
             pass
         rs_f = [f for f in filings if (f["form"].startswith("8-K") and "5.03" in f["items"])
                 or f["form"] in ("DEF 14A", "PRE 14A")]
         if rs_f:
-            lines.append("• إيداعات قد ترتبط بتقسيم عكسي/تعديل أسهم (تحقق من المستند):")
+            lines.append("• إيداعات قد ترتبط بتقسيم عكسي أو تعديل أسهم (يُنصح بمراجعة المستند):")
             lines += ["  " + l.replace("\n", "\n  ") for l in filing_lines(rs_f, 3)]
         rs_news = [n for n in news if re.search(r"reverse (stock )?split", n[1], re.I)][:2]
         for n in rs_news:
             lines.append(f"• خبر: {translate_ar(n[1])}\n  {n[3]}")
         warn = [f for f in filings if f["form"].startswith("8-K") and "3.01" in f["items"]]
         if warn:
-            lines.append("• ⚠️ إشعار إدراج/امتثال:")
+            lines.append("• ⚠️ إشعار إدراج / امتثال:")
             lines += ["  " + l.replace("\n", "\n  ") for l in filing_lines(warn, 2)]
         # التوزيعات
         dv = t.dividends
         if dv is not None and len(dv):
             last = dv.iloc[-1]
-            lines.append(f"• آخر توزيع: {last:.4f} {cur} بتاريخ {dv.index[-1].strftime('%Y-%m-%d')}"
-                         + (f" | العائد {info['dividendYield']:.2f}%" if num(info.get("dividendYield")) else ""))
+            yield_txt = f"  ·  العائد {info['dividendYield']:.2f}%" if num(info.get("dividendYield")) else ""
+            lines.append(f"• آخر توزيع: {last:.4f} {cur} بتاريخ {dv.index[-1].strftime('%Y-%m-%d')}{yield_txt}")
         else:
             lines.append("• لا توجد توزيعات أرباح.")
         sections.append("🏦 رأس المال والتوزيعات والتقسيم\n" + "\n".join(lines))
     except Exception as e:  # noqa
         log.warning("capital: %s", e)
 
-    # ── 7) الخسائر المتراكمة
+    # ── 7) الخسائر المتراكمة والسيولة
     try:
         bs = t.quarterly_balance_sheet
         if bs is None or bs.empty:
@@ -817,9 +884,9 @@ def analyze_stock(sym):
         if re_ is not None:
             v = re_.iloc[0]
             if v < 0:
-                lines.append(f"• نعم، لديها خسائر متراكمة بقيمة {money(abs(v), cur)} (بتاريخ {re_.index[0].strftime('%Y-%m-%d')})")
+                lines.append(f"• خسائر متراكمة: {money(abs(v), cur)}  (بتاريخ {re_.index[0].strftime('%Y-%m-%d')})")
             else:
-                lines.append(f"• لا، لديها أرباح محتجزة {money(v, cur)}")
+                lines.append(f"• أرباح محتجزة: {money(v, cur)}")
         else:
             lines.append("• الأرباح المحتجزة غير متاحة في المصدر.")
         qi = t.quarterly_income_stmt
@@ -832,21 +899,23 @@ def analyze_stock(sym):
             lines.append(f"• النقد المتاح: {money(cash.iloc[0], cur)}")
             if ocf is not None and len(ocf) >= 4 and ocf.iloc[:4].sum() < 0:
                 monthly = -ocf.iloc[:4].sum() / 12
-                lines.append(f"• حرق نقدي ≈ {money(monthly, cur)}/شهر → يكفي نحو {cash.iloc[0] / monthly:.1f} شهر")
-        sections.append("📉 الخسائر المتراكمة\n" + "\n".join(lines))
+                months = cash.iloc[0] / monthly if monthly else 0
+                warn = "  ⚠️ أقل من 12 شهراً" if months < 12 else ""
+                lines.append(f"• حرق نقدي تقريبي: {money(monthly, cur)} / شهر  ←  يكفي نحو {months:.1f} شهر{warn}")
+        sections.append("📉 الخسائر المتراكمة والسيولة\n" + "\n".join(lines))
     except Exception as e:  # noqa
         log.warning("deficit: %s", e)
 
     # ── 8) الأخبار
     try:
         today = [n for n in news if n[0] and now - n[0] < timedelta(hours=24)][:6]
-        shown, title = (today, "📰 أخبار اليوم") if today else (news[:6], "📰 آخر الأخبار المتاحة (لا أخبار خلال 24 ساعة)")
+        shown, title = (today, "📰 أخبار اليوم") if today else (news[:6], "📰 آخر الأخبار (لا يوجد خلال 24 ساعة)")
         if shown:
             ar = translate_lines([n[1] for n in shown])
             body = []
             for (dt, _, pub, link), a in zip(shown, ar):
                 stamp = dt.strftime("%m-%d %H:%M UTC") if dt else ""
-                body.append(f"• {a}\n  {pub} {stamp}\n  {link}")
+                body.append(f"• {a}\n  {pub}  {stamp}\n  {link}")
             sections.append(title + "\n" + "\n".join(body))
         else:
             sections.append("📰 الأخبار\n• لا توجد أخبار متاحة.")
@@ -855,7 +924,7 @@ def analyze_stock(sym):
 
     if sec_note:
         sections.append(sec_note)
-    sections.append("⚠️ المعلومات للاطلاع فقط وليست توصية بيع أو شراء.")
+    sections.append("⚠️ المعلومات للاطلاع فقط، وليست توصية بالبيع أو الشراء.")
     return ["\n\n".join(sections)]
 
 
@@ -875,24 +944,25 @@ FORM_AR = {
     "10-K": "تقرير سنوي (10-K)", "20-F": "تقرير سنوي أجنبي (20-F)", "DEF 14A": "بيان تفويض مساهمين",
 }
 ITEM_TAKEAWAY = {
-    "1.01": "اتفاقية جوهرية: تحقق من قيمة العقد وطرفه ومدته مقارنة بإيرادات الشركة.",
-    "1.02": "إنهاء اتفاقية: سلبي إذا كانت الاتفاقية مصدر دخل رئيسي.",
-    "1.03": "إفلاس/إعسار: خطر شديد.",
-    "2.02": "نتائج مالية: قارن الإيرادات والربحية بالتوقعات والربع السابق.",
-    "2.03": "التزام/دين جديد: راجع الفائدة والضمانات وقابلية التحويل لأسهم.",
-    "2.04": "تسريع التزام/تعثر: خطر سيولة.",
-    "2.05": "إعادة هيكلة/تسريح: قد يخفض التكاليف لكنه يعكس ضغطاً تشغيلياً.",
-    "2.06": "انخفاض قيمة أصول: أثر محاسبي سلبي.",
-    "3.01": "إشعار إدراج: خطر شطب، وكثيراً ما يتبعه تقسيم عكسي.",
-    "3.02": "إصدار أسهم غير مسجّل: تخفيف مباشر — قارن سعر الإصدار بسعر السوق.",
+    "1.01": "اتفاقية جوهرية — راجع قيمة العقد وطرفه ومدته مقارنة بإيرادات الشركة.",
+    "1.02": "إنهاء اتفاقية — سلبي إذا كانت مصدر دخل رئيسي.",
+    "1.03": "إفلاس / إعسار — خطر شديد.",
+    "2.02": "نتائج مالية — قارن الإيرادات والربحية بالتوقعات والربع السابق.",
+    "2.03": "التزام أو دين جديد — راجع الفائدة والضمانات وقابلية التحويل لأسهم.",
+    "2.04": "تسريع التزام أو تعثر — خطر سيولة.",
+    "2.05": "إعادة هيكلة / تسريح — قد يخفض التكاليف لكنه يعكس ضغطاً تشغيلياً.",
+    "2.06": "انخفاض قيمة أصول — أثر محاسبي سلبي.",
+    "3.01": "إشعار إدراج — خطر شطب، وغالباً ما يتبعه تقسيم عكسي.",
+    "3.02": "إصدار أسهم غير مسجّل — تخفيف مباشر؛ قارن سعر الإصدار بسعر السوق.",
     "3.03": "تعديل حقوق حملة الأسهم.",
-    "4.01": "تغيير المحاسب القانوني: راقب الأسباب.",
-    "4.02": "عدم الاعتماد على قوائم سابقة (إعادة بيان): إشارة خطر عالية.",
+    "4.01": "تغيير المحاسب القانوني — راقب الأسباب.",
+    "4.02": "عدم الاعتماد على قوائم سابقة (إعادة بيان) — إشارة خطر عالية.",
     "5.01": "تغيير في السيطرة.",
-    "5.02": "تغيير في الإدارة/المجلس: راجع المنصب وسبب المغادرة.",
-    "5.03": "تعديل النظام الأساسي: قد يتضمن تقسيماً عكسياً أو زيادة أسهم مصرّح بها.",
-    "5.07": "نتائج تصويت المساهمين: قد تتضمن الموافقة على زيادة أسهم أو تقسيم.",
-    "7.01": "إفصاح (عرض/بيان).", "8.01": "حدث آخر — اقرأ التفاصيل.",
+    "5.02": "تغيير في الإدارة أو المجلس — راجع المنصب وسبب المغادرة.",
+    "5.03": "تعديل النظام الأساسي — قد يتضمن تقسيماً عكسياً أو زيادة أسهم مصرّح بها.",
+    "5.07": "نتائج تصويت المساهمين — قد تتضمن الموافقة على زيادة أسهم أو تقسيم.",
+    "7.01": "إفصاح (عرض / بيان).",
+    "8.01": "حدث آخر — اقرأ التفاصيل.",
 }
 TX_AR = {"P": "شراء من السوق المفتوح", "S": "بيع في السوق المفتوح", "A": "منحة/مكافأة أسهم",
          "M": "ممارسة خيار/مشتق", "F": "سداد ضريبة/سعر الممارسة بأسهم", "G": "هبة", "D": "إعادة للشركة",
@@ -1002,12 +1072,12 @@ def flags_lines(text):
     risk, pos = scan_flags(text, RISK_PATTERNS), scan_flags(text, POS_PATTERNS)
     if risk:
         tr = translate_lines([x[1] for x in risk])
-        lines.append("\n🚩 إشارات خطر/تحذير:")
-        lines += [f"• {r[0]} (ورد {r[2]}×): «{t}»" for r, t in zip(risk, tr)]
+        lines.append("\n🚩 إشارات خطر:")
+        lines += [f"• {r[0]} (تكرر {r[2]}×):\n  «{t}»" for r, t in zip(risk, tr)]
     if pos:
         tr = translate_lines([x[1] for x in pos])
         lines.append("\n✅ إشارات إيجابية:")
-        lines += [f"• {p[0]} (ورد {p[2]}×): «{t}»" for p, t in zip(pos, tr)]
+        lines += [f"• {p[0]} (تكرر {p[2]}×):\n  «{t}»" for p, t in zip(pos, tr)]
     return lines
 
 
@@ -1067,44 +1137,47 @@ def analyze_13dg(root, raw_txt, meta):
     ticker = ticker_by_cik(icik) if icik else None
     price, mcap = last_price(ticker) if ticker else (None, None)
 
-    L = [f"🏢 الشركة المُصدِرة: {issuer or '—'}" + (f" ({ticker})" if ticker else "") +
-         (f" | CUSIP {cusip}" if cusip else ""),
-         f"📦 الفئة: {cls or '—'} | تاريخ الحدث: {event or '—'}" + (f"\n🏷 أساس الإفصاح: {basis}" if basis else ""),
-         "\n👤 المُفصِحون:"]
+    L = [
+        f"🏢 الشركة المُصدِرة: {issuer or '—'}" + (f" ({ticker})" if ticker else "") +
+        (f"  ·  CUSIP {cusip}" if cusip else ""),
+        f"📦 فئة الأوراق: {cls or '—'}  ·  تاريخ الحدث: {event or '—'}" +
+        (f"\n🏷 أساس الإفصاح: {basis}" if basis else ""),
+        "\n👤 المُفصحون:",
+    ]
     top = None
     for i, n in enumerate(names or ["—"]):
         p = pcts[i] if i < len(pcts) else None
         s = shs[i] if i < len(shs) else None
         t = HOLDER_TYPE.get(types[i], types[i]) if i < len(types) else ""
-        row = f"• {n}" + (f" [{t}]" if t else "")
+        row = f"• {n}" + (f"  [{t}]" if t else "")
         if s is not None:
             row += f": {s:,.0f} سهم"
         if p is not None:
-            row += f" = {p:.2f}% من الفئة"
+            row += f"  =  {p:.2f}% من الفئة"
             top = max(top or 0, p)
         if s is not None and price:
-            row += f" ≈ {money(s * price)}"
+            row += f"  ≈  {money(s * price)}"
         L.append(row)
     if mcap:
-        L.append(f"(القيمة السوقية للشركة حالياً ≈ {money(mcap)})")
-    L.append("\n🎯 الدلالة لمتخذ القرار:")
+        L.append(f"\nالقيمة السوقية الحالية للشركة ≈ {money(mcap)}")
+    L.append("\n🎯 الدلالة:")
     if is_d:
-        L.append("• 13D = ملكية ≥5% مع احتمال نية التأثير/السيطرة (نشاط مساهم) — حدث عالي الأولوية.")
+        L.append("• 13D: ملكية ≥5% مع احتمال نية التأثير أو السيطرة (نشاط مساهم) — أولوية عالية.")
     else:
-        L.append("• 13G = استثمار سلبي بلا نية سيطرة؛ يدل على اهتمام مؤسسي، لا على تدخل في الإدارة.")
+        L.append("• 13G: استثمار سلبي بلا نية سيطرة. يدل على اهتمام مؤسسي دون تدخل في الإدارة.")
     if top is not None:
         if "/A" in form and top < 5:
-            L.append("• ⚠️ النسبة أقل من 5% في تعديل — غالباً خروج/تخفيض تحت حد الإفصاح (ضغط بيعي محتمل).")
+            L.append("• ⚠️ النسبة أقل من 5% في تعديل — غالباً خروج أو تخفيض تحت حد الإفصاح (ضغط بيعي محتمل).")
         elif top >= 20:
-            L.append("• مالك بنسبة ≥20%: تأثير جوهري على القرارات وقابلية السيولة.")
+            L.append("• مالك بنسبة ≥20%: تأثير جوهري على القرارات والسيولة.")
         elif top >= 10:
-            L.append("• مالك بنسبة ≥10%: مساهم كبير (يخضع أيضاً للإفصاح الداخلي Form 4).")
+            L.append("• مالك بنسبة ≥10%: مساهم كبير (يخضع أيضاً لإفصاح Form 4).")
         else:
             L.append("• النسبة قريبة من حد الإفصاح 5%.")
     if "/A" in form:
-        L.append("• هذا تعديل: قارن بالإيداع السابق للجهة نفسها لمعرفة هل زادت الحصة أم نقصت.")
+        L.append("• هذا تعديل: قارن بالإيداع السابق لنفس الجهة لمعرفة إن زادت الحصة أو نقصت.")
     if is_d:
-        for key, lab in (("item3", "مصدر التمويل"), ("item4", "الغرض من الصفقة/النوايا")):
+        for key, lab in (("item3", "مصدر التمويل"), ("item4", "الغرض من الصفقة / النوايا")):
             for e in root.iter():
                 if _ln(e.tag).lower() == key:
                     t = " ".join(x.strip() for x in e.itertext() if x.strip())
@@ -1128,7 +1201,10 @@ def analyze_ownership(root, raw_txt, meta):
             if xv(ro, "isTenPercentOwner") in ("1", "true"):
                 rel.append("مالك +10%")
             owners.append(f"{xv(ro, 'rptOwnerName')} ({'، '.join(rel) or 'مرتبط'})")
-    L = [f"🏢 الشركة: {issuer or '—'}" + (f" ({sym})" if sym else ""), "👤 الداخلي: " + " | ".join(owners)]
+    L = [
+        f"🏢 الشركة: {issuer or '—'}" + (f" ({sym})" if sym else ""),
+        "👤 الداخلي: " + "  ·  ".join(owners),
+    ]
     rows = []
     for tx in root.iter():
         if _ln(tx.tag) == "nonDerivativeTransaction":
@@ -1140,39 +1216,56 @@ def analyze_ownership(root, raw_txt, meta):
     if rows:
         L.append("\n💱 المعاملات:")
         for r in rows[:10]:
-            val = f" ≈ {money((r['sh'] or 0) * r['px'])}" if r["sh"] and r["px"] else ""
-            L.append(f"• {r['date']} — {TX_AR.get(r['code'], r['code'])}: {r['sh'] or 0:,.0f} سهم"
-                     + (f" @ {r['px']:.2f}" if r["px"] else "") + val +
-                     (f" | الرصيد بعدها {r['after']:,.0f}" if r["after"] is not None else "") +
-                     (" (غير مباشر)" if r["own"] == "I" else ""))
+            val = f"  ≈  {money((r['sh'] or 0) * r['px'])}" if r["sh"] and r["px"] else ""
+            after_txt = f"  ·  الرصيد بعدها {r['after']:,.0f}" if r["after"] is not None else ""
+            indir = "  (غير مباشر)" if r["own"] == "I" else ""
+            L.append(
+                f"• {r['date']} — {TX_AR.get(r['code'], r['code'])}: "
+                f"{r['sh'] or 0:,.0f} سهم"
+                + (f" @ {r['px']:.2f}" if r["px"] else "")
+                + val + after_txt + indir
+            )
     holds = [xv(h, "sharesOwnedFollowingTransaction") for h in root.iter() if _ln(h.tag) == "nonDerivativeHolding"]
     if holds and not rows:
-        L.append("\n📦 الحيازات المُفصح عنها: " + "، ".join(f"{num(h) or 0:,.0f}" for h in holds[:5]) + " سهم")
+        L.append("\n📦 الحيازات المفصح عنها: " + "، ".join(f"{num(h) or 0:,.0f}" for h in holds[:5]) + " سهم")
     der = [t for t in root.iter() if _ln(t.tag) == "derivativeTransaction"]
     for d in der[:4]:
-        L.append(f"• مشتق/خيار: {xv(d, 'securityTitle')} — {TX_AR.get(xv(d, 'transactionCode'), xv(d, 'transactionCode'))}"
-                 f" | سعر التنفيذ {xv(d, 'conversionOrExercisePrice') or '—'}")
+        L.append(
+            f"• مشتق / خيار: {xv(d, 'securityTitle')} — "
+            f"{TX_AR.get(xv(d, 'transactionCode'), xv(d, 'transactionCode'))}"
+            f"  ·  سعر التنفيذ {xv(d, 'conversionOrExercisePrice') or '—'}"
+        )
     buys = sum((r["sh"] or 0) * (r["px"] or 0) for r in rows if r["code"] == "P")
     sells = sum((r["sh"] or 0) * (r["px"] or 0) for r in rows if r["code"] == "S")
     sold_sh = sum(r["sh"] or 0 for r in rows if r["code"] == "S")
     after = next((r["after"] for r in reversed(rows) if r["code"] == "S" and r["after"] is not None), None)
     plan = "10b5-1" in raw_txt.lower()
-    L.append("\n🎯 الدلالة لمتخذ القرار:")
+    L.append("\n🎯 الدلالة:")
     if buys:
-        L.append(f"• ✅ شراء بمبلغ ≈ {money(buys)} من السوق المفتوح بواسطة داخلي — من أقوى إشارات الثقة (قيّم حجمه نسبة لحصته).")
+        L.append(
+            f"• ✅ شراء من السوق المفتوح بمبلغ ≈ {money(buys)} بواسطة داخلي — "
+            "من أقوى إشارات الثقة (قيّم الحجم نسبةً لحصته)."
+        )
     if sells:
-        pct_sold = f" (≈{sold_sh / (after + sold_sh) * 100:.1f}% من حصته)" if after is not None and (after + sold_sh) else ""
-        L.append(f"• 🔻 بيع بمبلغ ≈ {money(sells)}{pct_sold}. "
-                 + ("نُفِّذ ضمن خطة 10b5-1 مسبقة → دلالة أقل." if plan else "لا يظهر أنه ضمن خطة مسبقة → دلالة أقوى."))
+        pct_sold = (
+            f" (≈{sold_sh / (after + sold_sh) * 100:.1f}% من حصته)"
+            if after is not None and (after + sold_sh) else ""
+        )
+        plan_txt = (
+            "نُفّذ ضمن خطة 10b5-1 مسبقة → دلالة أضعف."
+            if plan else
+            "لا يظهر أنه ضمن خطة مسبقة → دلالة أقوى."
+        )
+        L.append(f"• 🔻 بيع بمبلغ ≈ {money(sells)}{pct_sold}. {plan_txt}")
     if not buys and not sells:
-        L.append("• حركة روتينية (منح/ممارسة/ضريبة/حيازة) وليست قراراً استثمارياً في السوق.")
+        L.append("• حركة روتينية (منح / ممارسة / ضريبة / حيازة) وليست قراراً استثمارياً في السوق.")
     return L
 
 
 # ── نشرات الطرح
 def analyze_offering(text, meta):
     f = flat(text)
-    L = ["💼 بنود الطرح المُستخرجة (تحقق من المستند للتفاصيل الدقيقة):"]
+    L = ["💼 بنود الطرح المستخرجة (يُنصح بمراجعة المستند للتفاصيل الدقيقة):"]
     found = []
     for label, pat in OFFER_FIELDS:
         m = re.search(pat, f, re.I)
@@ -1180,11 +1273,16 @@ def analyze_offering(text, meta):
             found.append((label, m.group(0).strip()[:380]))
     if found:
         tr = translate_lines([x[1] for x in found])
-        L += [f"• {a[0]}: {t}" for a, t in zip(found, tr)]
+        L += [f"• {a[0]}:\n  {t}" for a, t in zip(found, tr)]
     else:
         L.append("• لم أتمكن من استخراج بنود الطرح آلياً.")
-    L.append("\n🎯 الدلالة: كل إصدار جديد يخفّف حصص الحاليين؛ قارن سعر الطرح بسعر السوق، وحجم الطرح بالقيمة السوقية، "
-             "ووجود وارنتات (تخفيف إضافي مستقبلاً).")
+    L.append(
+        "\n🎯 الدلالة:\n"
+        "• كل إصدار جديد يخفّف حصص المساهمين الحاليين.\n"
+        "• قارن سعر الطرح بسعر السوق الحالي.\n"
+        "• قارن حجم الطرح بالقيمة السوقية.\n"
+        "• راقب وجود وارنتات (تخفيف إضافي محتمل مستقبلاً)."
+    )
     return L + flags_lines(text)
 
 
@@ -1229,16 +1327,16 @@ def xbrl_lines(cik, acc):
                 got[label] = (c["val"], pv, dur, ce, "عن نفس الفترة من العام الماضي")
             break
     if not got:
-        return ["لا تتوفر بيانات XBRL لهذا الإيداع."]
+        return ["• لا تتوفر بيانات XBRL لهذا الإيداع."]
     any_end = next(iter(got.values()))[3]
     dur = next((g[2] for g in got.values() if g[2]), None)
-    L.append(f"📅 الفترة المنتهية: {any_end}" + (f" (مدة ≈ {round(dur / 30.4)} شهر)" if dur else ""))
+    L.append(f"📅 الفترة المنتهية: {any_end}" + (f"  (مدة ≈ {round(dur / 30.4)} شهر)" if dur else ""))
     for label, (v, pv, d, end, cmp_txt) in got.items():
         is_eps = "ربحية" in label
         val = f"{v:.2f}$" if is_eps else money(v)
         row = f"• {label}: {val}"
         if pv is not None:
-            row += f" | {cmp_txt}: {pct(v, pv)}"
+            row += f"  ({cmp_txt}: {pct(v, pv)})"
         L.append(row)
     try:
         dei = j["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"]["shares"]
@@ -1248,17 +1346,19 @@ def xbrl_lines(cik, acc):
     except Exception:
         pass
     cash, ocf = got.get("النقد"), got.get("التدفق النقدي التشغيلي")
-    L.append("\n🎯 الدلالة لمتخذ القرار:")
+    L.append("\n🎯 الدلالة:")
     if ocf and ocf[0] < 0 and cash and ocf[2]:
         burn = -ocf[0] / (ocf[2] / 30.4)
-        L.append(f"• حرق نقدي ≈ {money(burn)}/شهر → النقد الحالي يكفي ≈ {cash[0] / burn:.1f} شهر "
-                 + ("⚠️ (أقل من 12 شهراً: احتمال طرح أسهم/دين قريب)" if cash[0] / burn < 12 else ""))
+        months = cash[0] / burn if burn else 0
+        warn = "  ⚠️ أقل من 12 شهراً — احتمال طرح أسهم أو دين قريب" if months < 12 else ""
+        L.append(f"• حرق نقدي ≈ {money(burn)} / شهر  ←  النقد يكفي نحو {months:.1f} شهر{warn}")
     eq = got.get("حقوق المساهمين")
     if eq and eq[0] < 0:
-        L.append("• ⚠️ حقوق المساهمين سالبة: الالتزامات تفوق الأصول (خطر إدراج/استمرارية).")
+        L.append("• ⚠️ حقوق المساهمين سالبة: الالتزامات تفوق الأصول (خطر إدراج / استمرارية).")
     ni = got.get("صافي الربح/الخسارة")
     if ni and ni[0] < 0:
-        L.append("• الشركة خاسرة في هذه الفترة" + (" (والخسارة أعمق من العام الماضي)" if ni[1] is not None and ni[0] < ni[1] else "") + ".")
+        deeper = " (والخسارة أعمق من العام الماضي)" if ni[1] is not None and ni[0] < ni[1] else ""
+        L.append(f"• الشركة خاسرة في هذه الفترة{deeper}.")
     elif ni:
         L.append("• الشركة رابحة في هذه الفترة.")
     return L
@@ -1316,7 +1416,7 @@ def analyze_sec_filing(url):
     except Exception as e:  # noqa
         log.exception("sec analyze")
         L.append(f"⚠️ تعذّر التحليل المتخصص ({str(e)[:120]}).")
-    L += ["", f"🔗 {url}", "⚠️ استنتاجات آلية من نص الإيداع للاطلاع فقط وليست توصية."]
+    L += ["", f"🔗 {url}", "⚠️ استنتاجات آلية من نص الإيداع — للاطلاع فقط وليست توصية."]
     return ["\n".join(L)]
 
 
@@ -1368,7 +1468,7 @@ def analyze_8k(text, cik, acc, meta):
     L += flags_lines(pool)
     take = [f"• {c}: {ITEM_TAKEAWAY[c]}" for c in codes if c in ITEM_TAKEAWAY]
     if take:
-        L.append("\n🎯 الدلالة لمتخذ القرار:")
+        L.append("\n🎯 الدلالة:")
         L += take
     return L
 
@@ -1431,16 +1531,39 @@ def handle(msg):
 
     media = media_of(msg) or (media_of(reply) if cmd in ("tr", "sum") and not arg else None)
 
-    # ─ تحليل سهم
-    if not media:
-        sym = None
-        if cmd == "stock":
-            sym = find_symbol(arg or reply_text, strict=False)
-        elif cmd is None:
-            sym = find_symbol(text, strict=True)
-        if cmd == "stock" and not sym:
-            send(chat_id, "اكتب رمز السهم، مثال: /stock AAPL أو تحليل 2222")
+    # ─ تحليل سهم (حتى لو وُجدت صورة مرفقة مع «تحليل»)
+    sym = None
+    if cmd == "stock":
+        sym = find_symbol(arg or reply_text, strict=False)
+        # إن لم يُذكر الرمز، جرّب استخراجه من نص الصورة (OCR)
+        if not sym and media:
+            try:
+                file_id, fname = media
+                send(chat_id, "⏳ جاري البحث عن رمز السهم في الصورة ...", reply_to=mid)
+                ocr_txt = extract_text(download_file(file_id), fname)
+                sym = find_symbol(ocr_txt, strict=False)
+                if not sym:
+                    # أنماط شائعة في لقطات الشارت: AB، $AB، NASDAQ:AB
+                    m = re.search(
+                        r"(?:NASDAQ|NYSE|AMEX|TSE|TSX)[:\s]+([A-Z]{1,5})\b"
+                        r"|(?:ticker|symbol|رمز)[:\s]+([A-Z]{1,5})\b"
+                        r"|\b([A-Z]{1,5})\s*(?:USD|USD/|@)",
+                        ocr_txt, re.I,
+                    )
+                    if m:
+                        sym = norm_symbol(next(g for g in m.groups() if g))
+            except Exception as e:  # noqa
+                log.warning("ocr symbol: %s", e)
+        if not sym:
+            send(chat_id, "اكتب رمز السهم مع الأمر، مثال:\nتحليل AAPL\nأو /stock 2222")
             return
+        send(chat_id, f"⏳ جاري تحليل {sym} ... (قد يستغرق دقيقة)", reply_to=mid)
+        for part in analyze_stock(sym):
+            send(chat_id, part)
+        return
+
+    if cmd is None and not media:
+        sym = find_symbol(text, strict=True)
         if sym:
             send(chat_id, f"⏳ جاري تحليل {sym} ... (قد يستغرق دقيقة)", reply_to=mid)
             for part in analyze_stock(sym):
@@ -1449,7 +1572,7 @@ def handle(msg):
 
     typing(chat_id)
 
-    # ─ جمع المحتوى
+    # ─ جمع المحتوى (ترجمة / تلخيص)
     title, content = "النص", ""
     if media:
         file_id, fname = media
