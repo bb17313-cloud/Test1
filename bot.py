@@ -864,6 +864,515 @@ def pd_now(tz):
     return pd.Timestamp.now(tz=tz) if tz else pd.Timestamp.now()
 
 
+# ──────────────────────────── تحليل ملفات SEC (مستوى متخذ القرار) ────────────────────────────
+SEC_DOC_RE = re.compile(r"/data/(\d+)/(\d{18})/")
+
+FORM_AR = {
+    "3": "ملكية مبدئية لداخلي (Form 3)", "4": "تعاملات داخلية (Form 4)", "5": "تعاملات داخلية سنوية (Form 5)",
+    "SCHEDULE 13G": "ملكية ≥5% سلبية (13G)", "SCHEDULE 13D": "ملكية ≥5% بنية نشطة (13D)",
+    "SC 13G": "ملكية ≥5% سلبية (13G)", "SC 13D": "ملكية ≥5% بنية نشطة (13D)",
+    "8-K": "حدث جوهري (8-K)", "6-K": "إفصاح شركة أجنبية (6-K)", "10-Q": "تقرير ربع سنوي (10-Q)",
+    "10-K": "تقرير سنوي (10-K)", "20-F": "تقرير سنوي أجنبي (20-F)", "DEF 14A": "بيان تفويض مساهمين",
+}
+ITEM_TAKEAWAY = {
+    "1.01": "اتفاقية جوهرية: تحقق من قيمة العقد وطرفه ومدته مقارنة بإيرادات الشركة.",
+    "1.02": "إنهاء اتفاقية: سلبي إذا كانت الاتفاقية مصدر دخل رئيسي.",
+    "1.03": "إفلاس/إعسار: خطر شديد.",
+    "2.02": "نتائج مالية: قارن الإيرادات والربحية بالتوقعات والربع السابق.",
+    "2.03": "التزام/دين جديد: راجع الفائدة والضمانات وقابلية التحويل لأسهم.",
+    "2.04": "تسريع التزام/تعثر: خطر سيولة.",
+    "2.05": "إعادة هيكلة/تسريح: قد يخفض التكاليف لكنه يعكس ضغطاً تشغيلياً.",
+    "2.06": "انخفاض قيمة أصول: أثر محاسبي سلبي.",
+    "3.01": "إشعار إدراج: خطر شطب، وكثيراً ما يتبعه تقسيم عكسي.",
+    "3.02": "إصدار أسهم غير مسجّل: تخفيف مباشر — قارن سعر الإصدار بسعر السوق.",
+    "3.03": "تعديل حقوق حملة الأسهم.",
+    "4.01": "تغيير المحاسب القانوني: راقب الأسباب.",
+    "4.02": "عدم الاعتماد على قوائم سابقة (إعادة بيان): إشارة خطر عالية.",
+    "5.01": "تغيير في السيطرة.",
+    "5.02": "تغيير في الإدارة/المجلس: راجع المنصب وسبب المغادرة.",
+    "5.03": "تعديل النظام الأساسي: قد يتضمن تقسيماً عكسياً أو زيادة أسهم مصرّح بها.",
+    "5.07": "نتائج تصويت المساهمين: قد تتضمن الموافقة على زيادة أسهم أو تقسيم.",
+    "7.01": "إفصاح (عرض/بيان).", "8.01": "حدث آخر — اقرأ التفاصيل.",
+}
+TX_AR = {"P": "شراء من السوق المفتوح", "S": "بيع في السوق المفتوح", "A": "منحة/مكافأة أسهم",
+         "M": "ممارسة خيار/مشتق", "F": "سداد ضريبة/سعر الممارسة بأسهم", "G": "هبة", "D": "إعادة للشركة",
+         "C": "تحويل مشتق", "X": "ممارسة مشتق", "J": "أخرى", "W": "وصية/ميراث", "I": "عملية تقديرية"}
+HOLDER_TYPE = {"IA": "مدير استثمار", "BD": "وسيط/تاجر", "IN": "فرد", "CO": "شركة", "HC": "شركة قابضة",
+               "PN": "شراكة", "OO": "أخرى", "IC": "شركة تأمين", "EP": "صندوق تقاعد", "FI": "مؤسسة مالية أجنبية"}
+
+RISK_PATTERNS = [
+    ("استمرارية المنشأة (Going Concern)", r"substantial doubt|going concern"),
+    ("تقسيم عكسي", r"reverse (?:stock |share )?split"),
+    ("خطر الشطب/عدم امتثال إدراج", r"minimum bid|delist|listing (?:rule|deficiency)|deficiency notice"),
+    ("تخفيف: طرح أسهم/وارنتات", r"private placement|registered direct|at-the-market|securities purchase agreement|pre-funded warrant|public offering"),
+    ("دين تحويلي", r"convertible (?:promissory )?(?:note|debenture)"),
+    ("تعثر/إفلاس", r"event of default|chapter 11|chapter 7|bankruptcy|insolven"),
+    ("إعادة بيان/ضعف رقابة داخلية", r"non-reliance|restate|material weakness"),
+    ("استقالة/إنهاء مسؤول", r"resign|stepped down|terminated .{0,30}(?:employment|agreement)"),
+]
+POS_PATTERNS = [
+    ("عقد/طلبية/ترسية", r"awarded|purchase order|(?:entered into|signed) (?:a |an )?(?:\w+ ){0,3}(?:contract|agreement)"),
+    ("موافقة/ترخيص تنظيمي", r"FDA (?:approval|clearance)|received (?:regulatory )?approval|clearance from"),
+    ("نمو قياسي", r"record (?:revenue|quarter|sales|results)"),
+    ("استحواذ/شراكة استراتيجية", r"acquisition of|strategic (?:partnership|investment)|definitive agreement"),
+    ("إعادة شراء/توزيعات", r"share repurchase|buyback|special dividend"),
+]
+OFFER_FIELDS = [
+    ("حجم/شروط الطرح", r"[^.]{0,80}\b(?:offering|offer|selling|sell)\b[^.]{0,40}\bup to\b[^.]{0,200}\."),
+    ("السعر (طرح/تنفيذ/تحويل)", r"[^.]{0,60}(?:public offering price|offering price|exercise price|conversion price|purchase price)[^.]{0,180}\."),
+    ("الوارنتات", r"[^.]{0,60}\bwarrants?\b[^.]{0,200}\."),
+    ("العوائد", r"[^.]{0,60}(?:gross|net) proceeds[^.]{0,200}\."),
+    ("الأسهم بعد الطرح", r"[^.]{0,60}outstanding\s+(?:immediately\s+)?after[^.]{0,200}\."),
+    ("وكيل الطرح/المكتتب", r"[^.]{0,40}(?:placement agent|underwriter|sales agent)[^.]{0,160}\."),
+    ("استخدام العوائد", r"use of proceeds[:\.\s]+[^.]{20,300}\."),
+]
+XB_METRICS = [
+    ("الإيرادات", ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"], "flow"),
+    ("صافي الربح/الخسارة", ["NetIncomeLoss", "ProfitLoss"], "flow"),
+    ("الربح التشغيلي", ["OperatingIncomeLoss"], "flow"),
+    ("ربحية السهم", ["EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted", "EarningsPerShareBasic"], "flow"),
+    ("التدفق النقدي التشغيلي", ["NetCashProvidedByUsedInOperatingActivities"], "flow"),
+    ("النقد", ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"], "inst"),
+    ("إجمالي الالتزامات", ["Liabilities"], "inst"),
+    ("حقوق المساهمين", ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"], "inst"),
+    ("الخسائر المتراكمة (سالب) / الأرباح المحتجزة", ["RetainedEarningsAccumulatedDeficit"], "inst"),
+]
+
+
+def sec_get(url, timeout=60):
+    time.sleep(0.2)
+    r = requests.get(url, headers=SEC_HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r.content
+
+
+def _ln(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def xml_find(root, *subs):
+    out = []
+    for e in root.iter():
+        n = _ln(e.tag).lower()
+        if all(s in n for s in subs) and (e.text or "").strip():
+            out.append(e.text.strip())
+    return out
+
+
+def xml_one(root, *subs):
+    v = xml_find(root, *subs)
+    return v[0] if v else ""
+
+
+def xv(el, name):
+    for e in el.iter():
+        if _ln(e.tag) == name:
+            for c in e.iter():
+                if _ln(c.tag) == "value" and (c.text or "").strip():
+                    return c.text.strip()
+            if (e.text or "").strip():
+                return e.text.strip()
+    return ""
+
+
+def html_text(raw):
+    soup = BeautifulSoup(raw, "lxml")
+    for t in soup(["script", "style", "noscript", "ix:header"]):
+        t.decompose()
+    return soup.get_text("\n")
+
+
+def flat(text):
+    return re.sub(r"\s+", " ", text or "")
+
+
+def scan_flags(text, patterns, width=110):
+    f = flat(text)
+    out = []
+    for label, pat in patterns:
+        m = re.search(pat, f, re.I)
+        if m:
+            s, e = max(0, m.start() - width), min(len(f), m.end() + width)
+            out.append((label, f[s:e].strip(), len(re.findall(pat, f, re.I))))
+    return out
+
+
+def flags_lines(text):
+    lines = []
+    risk, pos = scan_flags(text, RISK_PATTERNS), scan_flags(text, POS_PATTERNS)
+    if risk:
+        tr = translate_lines([x[1] for x in risk])
+        lines.append("\n🚩 إشارات خطر/تحذير:")
+        lines += [f"• {r[0]} (ورد {r[2]}×): «{t}»" for r, t in zip(risk, tr)]
+    if pos:
+        tr = translate_lines([x[1] for x in pos])
+        lines.append("\n✅ إشارات إيجابية:")
+        lines += [f"• {p[0]} (ورد {p[2]}×): «{t}»" for p, t in zip(pos, tr)]
+    return lines
+
+
+def sec_meta(cik, acc):
+    dashed = f"{acc[:10]}-{acc[10:12]}-{acc[12:]}"
+    meta = {}
+    try:
+        j = requests.get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json",
+                         headers=SEC_HEADERS, timeout=30).json()
+        meta["name"], meta["tickers"] = j.get("name", ""), j.get("tickers", [])
+        r = j["filings"]["recent"]
+        if dashed in r["accessionNumber"]:
+            i = r["accessionNumber"].index(dashed)
+            meta["form"], meta["date"] = r["form"][i], r["filingDate"][i]
+            meta["items"] = (r.get("items") or [""] * (i + 1))[i]
+    except Exception as e:  # noqa
+        log.warning("sec_meta: %s", e)
+    return meta
+
+
+def last_price(sym):
+    try:
+        import yfinance as yf
+        fi = yf.Ticker(sym).fast_info
+        return num(fi["last_price"]), num(fi["market_cap"])
+    except Exception:
+        return None, None
+
+
+def ticker_by_cik(cik):
+    try:
+        sec_cik("AAPL")  # تحميل الخريطة
+        z = str(int(cik)).zfill(10)
+        for k, v in _SEC_MAP.items():
+            if v == z:
+                return k
+    except Exception:
+        pass
+    return None
+
+
+# ── 13D / 13G
+def analyze_13dg(root, raw_txt, meta):
+    form = (meta.get("form") or xml_one(root, "submissiontype") or "13G").upper()
+    is_d = "13D" in form
+    issuer, cusip = xml_one(root, "issuername"), xml_one(root, "cusip")
+    icik, cls, event = xml_one(root, "issuercik"), xml_one(root, "securitiesclasstitle"), xml_one(root, "eventdate")
+    names = xml_find(root, "reportingpersonname")
+    pcts = [num(x.replace("%", "")) for x in xml_find(root, "classpercent")]
+    shs = [num(x.replace(",", "")) for x in xml_find(root, "aggregate", "shares")] or \
+          [num(x.replace(",", "")) for x in xml_find(root, "aggregate", "amount")]
+    types = xml_find(root, "typeofreportingperson")
+    low = raw_txt.lower()
+    basis = ("مؤسسة مالية مؤهلة (13d-1(b))" if "13d-1(b)" in low else
+             "مستثمر سلبي (13d-1(c))" if "13d-1(c)" in low else
+             "مالك قبل الطرح/معفى (13d-1(d))" if "13d-1(d)" in low else "")
+    ticker = ticker_by_cik(icik) if icik else None
+    price, mcap = last_price(ticker) if ticker else (None, None)
+
+    L = [f"🏢 الشركة المُصدِرة: {issuer or '—'}" + (f" ({ticker})" if ticker else "") +
+         (f" | CUSIP {cusip}" if cusip else ""),
+         f"📦 الفئة: {cls or '—'} | تاريخ الحدث: {event or '—'}" + (f"\n🏷 أساس الإفصاح: {basis}" if basis else ""),
+         "\n👤 المُفصِحون:"]
+    top = None
+    for i, n in enumerate(names or ["—"]):
+        p = pcts[i] if i < len(pcts) else None
+        s = shs[i] if i < len(shs) else None
+        t = HOLDER_TYPE.get(types[i], types[i]) if i < len(types) else ""
+        row = f"• {n}" + (f" [{t}]" if t else "")
+        if s is not None:
+            row += f": {s:,.0f} سهم"
+        if p is not None:
+            row += f" = {p:.2f}% من الفئة"
+            top = max(top or 0, p)
+        if s is not None and price:
+            row += f" ≈ {money(s * price)}"
+        L.append(row)
+    if mcap:
+        L.append(f"(القيمة السوقية للشركة حالياً ≈ {money(mcap)})")
+    L.append("\n🎯 الدلالة لمتخذ القرار:")
+    if is_d:
+        L.append("• 13D = ملكية ≥5% مع احتمال نية التأثير/السيطرة (نشاط مساهم) — حدث عالي الأولوية.")
+    else:
+        L.append("• 13G = استثمار سلبي بلا نية سيطرة؛ يدل على اهتمام مؤسسي، لا على تدخل في الإدارة.")
+    if top is not None:
+        if "/A" in form and top < 5:
+            L.append("• ⚠️ النسبة أقل من 5% في تعديل — غالباً خروج/تخفيض تحت حد الإفصاح (ضغط بيعي محتمل).")
+        elif top >= 20:
+            L.append("• مالك بنسبة ≥20%: تأثير جوهري على القرارات وقابلية السيولة.")
+        elif top >= 10:
+            L.append("• مالك بنسبة ≥10%: مساهم كبير (يخضع أيضاً للإفصاح الداخلي Form 4).")
+        else:
+            L.append("• النسبة قريبة من حد الإفصاح 5%.")
+    if "/A" in form:
+        L.append("• هذا تعديل: قارن بالإيداع السابق للجهة نفسها لمعرفة هل زادت الحصة أم نقصت.")
+    if is_d:
+        for key, lab in (("item3", "مصدر التمويل"), ("item4", "الغرض من الصفقة/النوايا")):
+            for e in root.iter():
+                if _ln(e.tag).lower() == key:
+                    t = " ".join(x.strip() for x in e.itertext() if x.strip())
+                    if len(t) > 40:
+                        L.append(f"\n📝 {lab}:\n{translate_ar(t[:1500])}")
+                        break
+    return L
+
+
+# ── Form 3/4/5
+def analyze_ownership(root, raw_txt, meta):
+    issuer, sym = xml_one(root, "issuername"), xml_one(root, "issuertradingsymbol")
+    owners = []
+    for ro in root.iter():
+        if _ln(ro.tag) == "reportingOwner":
+            rel = []
+            if xv(ro, "isDirector") in ("1", "true"):
+                rel.append("عضو مجلس إدارة")
+            if xv(ro, "isOfficer") in ("1", "true"):
+                rel.append(xv(ro, "officerTitle") or "مسؤول تنفيذي")
+            if xv(ro, "isTenPercentOwner") in ("1", "true"):
+                rel.append("مالك +10%")
+            owners.append(f"{xv(ro, 'rptOwnerName')} ({'، '.join(rel) or 'مرتبط'})")
+    L = [f"🏢 الشركة: {issuer or '—'}" + (f" ({sym})" if sym else ""), "👤 الداخلي: " + " | ".join(owners)]
+    rows = []
+    for tx in root.iter():
+        if _ln(tx.tag) == "nonDerivativeTransaction":
+            rows.append(dict(title=xv(tx, "securityTitle"), date=xv(tx, "transactionDate"),
+                             code=xv(tx, "transactionCode"), sh=num(xv(tx, "transactionShares")),
+                             px=num(xv(tx, "transactionPricePerShare")),
+                             after=num(xv(tx, "sharesOwnedFollowingTransaction")),
+                             own=xv(tx, "directOrIndirectOwnership")))
+    if rows:
+        L.append("\n💱 المعاملات:")
+        for r in rows[:10]:
+            val = f" ≈ {money((r['sh'] or 0) * r['px'])}" if r["sh"] and r["px"] else ""
+            L.append(f"• {r['date']} — {TX_AR.get(r['code'], r['code'])}: {r['sh'] or 0:,.0f} سهم"
+                     + (f" @ {r['px']:.2f}" if r["px"] else "") + val +
+                     (f" | الرصيد بعدها {r['after']:,.0f}" if r["after"] is not None else "") +
+                     (" (غير مباشر)" if r["own"] == "I" else ""))
+    holds = [xv(h, "sharesOwnedFollowingTransaction") for h in root.iter() if _ln(h.tag) == "nonDerivativeHolding"]
+    if holds and not rows:
+        L.append("\n📦 الحيازات المُفصح عنها: " + "، ".join(f"{num(h) or 0:,.0f}" for h in holds[:5]) + " سهم")
+    der = [t for t in root.iter() if _ln(t.tag) == "derivativeTransaction"]
+    for d in der[:4]:
+        L.append(f"• مشتق/خيار: {xv(d, 'securityTitle')} — {TX_AR.get(xv(d, 'transactionCode'), xv(d, 'transactionCode'))}"
+                 f" | سعر التنفيذ {xv(d, 'conversionOrExercisePrice') or '—'}")
+    buys = sum((r["sh"] or 0) * (r["px"] or 0) for r in rows if r["code"] == "P")
+    sells = sum((r["sh"] or 0) * (r["px"] or 0) for r in rows if r["code"] == "S")
+    sold_sh = sum(r["sh"] or 0 for r in rows if r["code"] == "S")
+    after = next((r["after"] for r in reversed(rows) if r["code"] == "S" and r["after"] is not None), None)
+    plan = "10b5-1" in raw_txt.lower()
+    L.append("\n🎯 الدلالة لمتخذ القرار:")
+    if buys:
+        L.append(f"• ✅ شراء بمبلغ ≈ {money(buys)} من السوق المفتوح بواسطة داخلي — من أقوى إشارات الثقة (قيّم حجمه نسبة لحصته).")
+    if sells:
+        pct_sold = f" (≈{sold_sh / (after + sold_sh) * 100:.1f}% من حصته)" if after is not None and (after + sold_sh) else ""
+        L.append(f"• 🔻 بيع بمبلغ ≈ {money(sells)}{pct_sold}. "
+                 + ("نُفِّذ ضمن خطة 10b5-1 مسبقة → دلالة أقل." if plan else "لا يظهر أنه ضمن خطة مسبقة → دلالة أقوى."))
+    if not buys and not sells:
+        L.append("• حركة روتينية (منح/ممارسة/ضريبة/حيازة) وليست قراراً استثمارياً في السوق.")
+    return L
+
+
+# ── نشرات الطرح
+def analyze_offering(text, meta):
+    f = flat(text)
+    L = ["💼 بنود الطرح المُستخرجة (تحقق من المستند للتفاصيل الدقيقة):"]
+    found = []
+    for label, pat in OFFER_FIELDS:
+        m = re.search(pat, f, re.I)
+        if m:
+            found.append((label, m.group(0).strip()[:380]))
+    if found:
+        tr = translate_lines([x[1] for x in found])
+        L += [f"• {a[0]}: {t}" for a, t in zip(found, tr)]
+    else:
+        L.append("• لم أتمكن من استخراج بنود الطرح آلياً.")
+    L.append("\n🎯 الدلالة: كل إصدار جديد يخفّف حصص الحاليين؛ قارن سعر الطرح بسعر السوق، وحجم الطرح بالقيمة السوقية، "
+             "ووجود وارنتات (تخفيف إضافي مستقبلاً).")
+    return L + flags_lines(text)
+
+
+# ── 10-Q / 10-K عبر XBRL
+def _d(s):
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
+def xbrl_lines(cik, acc):
+    dashed = f"{acc[:10]}-{acc[10:12]}-{acc[12:]}"
+    j = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(cik):010d}.json",
+                     headers=SEC_HEADERS, timeout=90).json()
+    us = j.get("facts", {}).get("us-gaap", {})
+    L, got = [], {}
+    for label, tags, kind in XB_METRICS:
+        for tag in tags:
+            node = us.get(tag)
+            if not node:
+                continue
+            unit = "USD" if "USD" in node["units"] else ("USD/shares" if "USD/shares" in node["units"] else None)
+            rows = [r for r in node["units"].get(unit, []) if r.get("accn") == dashed] if unit else []
+            if not rows:
+                continue
+            if kind == "inst":
+                ends = sorted({r["end"] for r in rows}, reverse=True)
+                v = next(r["val"] for r in rows if r["end"] == ends[0])
+                pv = next((r["val"] for r in rows if len(ends) > 1 and r["end"] == ends[1]), None)
+                got[label] = (v, pv, None, ends[0], "عن نهاية الفترة السابقة")
+            else:
+                flows = [r for r in rows if r.get("start")]
+                if not flows:
+                    continue
+                ce = max(r["end"] for r in flows)
+                c = min((r for r in flows if r["end"] == ce), key=lambda r: (_d(r["end"]) - _d(r["start"])).days)
+                dur = (_d(c["end"]) - _d(c["start"])).days
+                pv = None
+                for r in flows:
+                    gap = (_d(c["end"]) - _d(r["end"])).days
+                    if 330 <= gap <= 400 and abs((_d(r["end"]) - _d(r["start"])).days - dur) <= 20:
+                        pv = r["val"]
+                        break
+                got[label] = (c["val"], pv, dur, ce, "عن نفس الفترة من العام الماضي")
+            break
+    if not got:
+        return ["لا تتوفر بيانات XBRL لهذا الإيداع."]
+    any_end = next(iter(got.values()))[3]
+    dur = next((g[2] for g in got.values() if g[2]), None)
+    L.append(f"📅 الفترة المنتهية: {any_end}" + (f" (مدة ≈ {round(dur / 30.4)} شهر)" if dur else ""))
+    for label, (v, pv, d, end, cmp_txt) in got.items():
+        is_eps = "ربحية" in label
+        val = f"{v:.2f}$" if is_eps else money(v)
+        row = f"• {label}: {val}"
+        if pv is not None:
+            row += f" | {cmp_txt}: {pct(v, pv)}"
+        L.append(row)
+    try:
+        dei = j["facts"]["dei"]["EntityCommonStockSharesOutstanding"]["units"]["shares"]
+        sh = [r for r in dei if r.get("accn") == dashed]
+        if sh:
+            L.append(f"• الأسهم القائمة (غلاف التقرير): {sh[-1]['val']:,.0f}")
+    except Exception:
+        pass
+    cash, ocf = got.get("النقد"), got.get("التدفق النقدي التشغيلي")
+    L.append("\n🎯 الدلالة لمتخذ القرار:")
+    if ocf and ocf[0] < 0 and cash and ocf[2]:
+        burn = -ocf[0] / (ocf[2] / 30.4)
+        L.append(f"• حرق نقدي ≈ {money(burn)}/شهر → النقد الحالي يكفي ≈ {cash[0] / burn:.1f} شهر "
+                 + ("⚠️ (أقل من 12 شهراً: احتمال طرح أسهم/دين قريب)" if cash[0] / burn < 12 else ""))
+    eq = got.get("حقوق المساهمين")
+    if eq and eq[0] < 0:
+        L.append("• ⚠️ حقوق المساهمين سالبة: الالتزامات تفوق الأصول (خطر إدراج/استمرارية).")
+    ni = got.get("صافي الربح/الخسارة")
+    if ni and ni[0] < 0:
+        L.append("• الشركة خاسرة في هذه الفترة" + (" (والخسارة أعمق من العام الماضي)" if ni[1] is not None and ni[0] < ni[1] else "") + ".")
+    elif ni:
+        L.append("• الشركة رابحة في هذه الفترة.")
+    return L
+
+
+# ── نقطة الدخول
+def analyze_sec_filing(url):
+    m = SEC_DOC_RE.search(url)
+    if not m:
+        return ["⚠️ لم أتعرف على رابط ملف SEC (يجب أن يكون من /Archives/edgar/data/...)."]
+    cik, acc = m.group(1), m.group(2)
+    meta = sec_meta(cik, acc)
+    raw = sec_get(re.sub(r"/xsl[^/]+/", "/", url))
+    txt = raw.decode("utf-8", "ignore")
+    head = txt[:4000].lower()
+    form = (meta.get("form") or "").upper()
+    root = None
+    if "<ownershipdocument" in head or "<edgarsubmission" in head:
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            root = None
+        if not form:
+            form = "4" if "<ownershipdocument" in head else "SCHEDULE 13G"
+    if not form:
+        mm = re.search(r"FORM\s+(8-K|10-Q|10-K|6-K|20-F|S-1|S-3|F-1|F-3|424B\d)", html_text(raw)[:6000], re.I)
+        form = mm.group(1).upper() if mm else "OTHER"
+
+    base = form.split("/")[0]
+    label = next((v for k, v in FORM_AR.items() if base == k or base.startswith(k + " ")), form)
+    name = meta.get("name") or ""
+    tick = ", ".join(meta.get("tickers") or [])
+    L = [f"📄 {name}" + (f" ({tick})" if tick else ""),
+         f"النوع: {label} | الإيداع: {meta.get('date') or '—'}", ""]
+
+    try:
+        if root is not None and base in ("3", "4", "5"):
+            L += analyze_ownership(root, txt, meta)
+        elif root is not None and ("13D" in form or "13G" in form):
+            L += analyze_13dg(root, txt, meta)
+        else:
+            text = html_text(raw)
+            if base in ("424B1", "424B2", "424B3", "424B4", "424B5", "424B7", "424B8", "S-1", "S-3", "F-1", "F-3", "S-11"):
+                L += analyze_offering(text, meta)
+            elif base in ("10-Q", "10-K"):
+                L += xbrl_lines(cik, acc)
+                L += flags_lines(text)
+            elif base in ("8-K", "6-K"):
+                L += analyze_8k(text, cik, acc, meta)
+            else:
+                sents = summarize_extractive(text, 8)
+                L.append("📝 أهم ما ورد:")
+                L += [f"• {s}" for s in translate_lines(sents)]
+                L += flags_lines(text)
+    except Exception as e:  # noqa
+        log.exception("sec analyze")
+        L.append(f"⚠️ تعذّر التحليل المتخصص ({str(e)[:120]}).")
+    L += ["", f"🔗 {url}", "⚠️ استنتاجات آلية من نص الإيداع للاطلاع فقط وليست توصية."]
+    return ["\n".join(L)]
+
+
+def analyze_8k(text, cik, acc, meta):
+    pat = re.compile(r"(?im)^\s*item\s+(\d\.\d{2})\b[\.\s:\-–—]*(.*)$")
+    ms = list(pat.finditer(text))
+    items = {}
+    for i, mm in enumerate(ms):
+        end = ms[i + 1].start() if i + 1 < len(ms) else len(text)
+        sect = re.split(r"(?i)\n\s*signatures?\s*\n", text[mm.end():end])[0]
+        body = (mm.group(2) + "\n" + sect).strip()
+        if mm.group(1) not in items or len(body) > len(items[mm.group(1)]):
+            items[mm.group(1)] = body
+    codes = [c for c in items if c != "9.01"] or [c for c in (meta.get("items") or "").split(",") if c and c != "9.01"]
+    L = ["🔎 ما حدث (بنود الإفصاح):"]
+    L += [f"• {c} — {ITEM_AR.get(c, 'بند')}" for c in codes] or ["• لم أستطع تحديد البنود."]
+    pool = ""
+    for c in codes:
+        body = items.get(c, "")
+        if not body:
+            continue
+        pool += "\n" + body
+        sents = summarize_extractive(body, 4) if len(split_sentences(body)) > 4 else split_sentences(body)[:4]
+        if sents:
+            L.append(f"\n📌 تفاصيل البند {c}:")
+            L += [f"• {s}" for s in translate_lines(sents)]
+    try:  # البيان الصحفي EX-99
+        idx = requests.get(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/index.json",
+                           headers=SEC_HEADERS, timeout=30).json()
+        names = [x["name"] for x in idx["directory"]["item"]]
+        ex = next((n for n in names if re.search(r"(?i)ex-?99.*\.htm", n)), None)
+        if ex:
+            pr = html_text(sec_get(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{ex}"))
+            pool += "\n" + pr
+            sents = summarize_extractive(pr, 6)
+            if sents:
+                L.append("\n📎 البيان الصحفي المرفق:")
+                L += [f"• {s}" for s in translate_lines(sents)]
+            figs = key_figures(pr, set(sents), 5)
+            if figs:
+                L.append("\n💵 أرقام بارزة:")
+                L += [f"• {s}" for s in translate_lines(figs)]
+    except Exception as e:  # noqa
+        log.warning("ex99: %s", e)
+    figs = key_figures(pool, set(), 4) if pool and "💵" not in "\n".join(L) else []
+    if figs:
+        L.append("\n💵 أرقام بارزة:")
+        L += [f"• {s}" for s in translate_lines(figs)]
+    L += flags_lines(pool)
+    take = [f"• {c}: {ITEM_TAKEAWAY[c]}" for c in codes if c in ITEM_TAKEAWAY]
+    if take:
+        L.append("\n🎯 الدلالة لمتخذ القرار:")
+        L += take
+    return L
+
+
 # ──────────────────────────── توجيه الرسائل ────────────────────────────
 CMD_ALIAS = {"tr": "tr", "translate": "tr", "sum": "sum", "summary": "sum", "summarize": "sum",
              "stock": "stock", "s": "stock", "analyze": "stock", "start": "help", "help": "help"}
@@ -953,6 +1462,10 @@ def handle(msg):
         m = URL_RE.search(src)
         if m and len(src.strip()) < len(m.group(0)) + 20:
             send(chat_id, "⏳ جاري قراءة الرابط ...", reply_to=mid)
+            if "sec.gov/Archives" in m.group(0) and cmd != "tr":
+                for part in analyze_sec_filing(m.group(0)):
+                    send(chat_id, part)
+                return
             title, content = fetch_article(m.group(0))
             action = cmd or "sum"
         else:
