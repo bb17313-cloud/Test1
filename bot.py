@@ -141,35 +141,55 @@ def chunk_text(text, limit=4000):
     return chunks
 
 
+def _gtx(chunk, sl):
+    r = requests.post(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": sl, "tl": "ar", "dt": "t"},
+        data={"q": chunk}, headers=WEB_HEADERS, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return "".join(x[0] for x in data[0] if x and x[0])
+
+
 def _translate_chunk(chunk):
     if not chunk.strip():
         return chunk
-    for attempt in range(3):
-        try:
-            from deep_translator import GoogleTranslator
-            out = GoogleTranslator(source="auto", target="ar").translate(chunk)
-            if out:
+    needs = bool(re.search(r"[^\W\d_]", chunk)) and not is_arabic(chunk, 0.9)
+    has_latin = bool(re.search(r"[A-Za-z]{3}", chunk))
+    best, last_err = None, None
+    for sl in ("auto", "en"):
+        out = None
+        for attempt in range(3):
+            try:
+                out = _gtx(chunk, sl)
+                break
+            except Exception as e:  # noqa
+                last_err = e
+                log.warning("gtx %s: %s", sl, e)
+                time.sleep(1.5 * (attempt + 1))
+        if out and out.strip() and (out.strip() != chunk.strip() or not needs):
+            best = out
+            if is_arabic(out, 0.6) or not has_latin:
                 return out
-        except Exception as e:  # noqa
-            log.warning("deep_translator: %s", e)
-            time.sleep(1.5 * (attempt + 1))
-    try:  # احتياطي: نقطة Google المجانية مباشرة
-        r = requests.post(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "auto", "tl": "ar", "dt": "t"},
-            data={"q": chunk}, headers=WEB_HEADERS, timeout=30)
-        data = r.json()
-        return "".join(x[0] for x in data[0] if x and x[0])
+    if best:
+        return best
+    try:  # احتياطي ثانٍ
+        from deep_translator import GoogleTranslator
+        for sl in ("auto", "en"):
+            out = GoogleTranslator(source=sl, target="ar").translate(chunk)
+            if out and out.strip() != chunk.strip():
+                return out
     except Exception as e:  # noqa
-        log.warning("gtx fallback: %s", e)
-        return chunk
+        last_err = e
+        log.warning("deep_translator: %s", e)
+    raise RuntimeError(f"فشلت الترجمة (Google لم يُرجع ترجمة). {last_err or ''}"[:250])
 
 
 def translate_ar(text):
     text = (text or "").strip()
-    if not text or is_arabic(text):
+    if not text or is_arabic(text, 0.9):
         return text
-    return "\n".join(_translate_chunk(c) for c in chunk_text(text, 4000))
+    return "\n".join(_translate_chunk(c) for c in chunk_text(text, 1800))
 
 
 def translate_lines(lines):
@@ -192,7 +212,7 @@ def translate_lines(lines):
 
     size = 0
     for i, l in enumerate(lines):
-        if not l or is_arabic(l):
+        if not l or is_arabic(l, 0.9):
             result[i] = l
             continue
         if size + len(l) > 3500:
