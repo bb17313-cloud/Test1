@@ -1,43 +1,44 @@
-name: bot
+name: telegram-bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+    - cron: "0 * * * *"     # تحقق كل ساعة (يبقى تشغيل واحد فقط بفضل concurrency)
+  workflow_dispatch:         # تشغيل يدوي من تبويب Actions
 
+# تشغيل واحد في كل مرة؛ التشغيل الجديد ينتظر انتهاء الحالي ثم يبدأ فوراً
 concurrency:
   group: telegram-bot
   cancel-in-progress: false
 
 jobs:
-  run:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 355
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Python packages
+      - name: Install OCR (لاستخراج النص من الصور)
         run: |
-          pip install requests beautifulsoup4 pypdf yt-dlp faster-whisper playwright
-          playwright install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-ara
 
-      - name: Cache Whisper model
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: whisper-${{ runner.os }}-small
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml deep-translator pypdf python-docx \
+                      python-pptx openpyxl yfinance pandas pillow pytesseract
 
       - name: Run bot
-        run: python bot.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          SEC_USER_AGENT: "stockxxx90@gmail.com"
-          RUN_SECONDS: "1700"
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}   # اختياري: "MyBot myemail@gmail.com"
+          RUN_SECONDS: "20700"                            # ~5 ساعات و45 دقيقة
+        run: python bot.py
