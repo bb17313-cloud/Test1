@@ -6,12 +6,12 @@ from datetime import datetime
 import pytz
 import requests
 
-# قراءة الإعدادات بالصيغة الخاصة بك
+# قراءة الإعدادات
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 FINVIZ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 # سجل التنبيهات: يمنع التكرار إذا لم يتغير السعر ويرقّم التنبيهات لكل سهم
@@ -55,24 +55,28 @@ class FinvizRowsParser(HTMLParser):
             self.cell_text.append(data)
 
 def fetch_finviz_signal(signal, limit=20):
-    """جلب أسهم Signal معيّن من صفحة الفاحص مباشرة (بدون مكتبة finviz)"""
+    """جلب أسهم Signal معيّن من صفحة الفاحص مباشرة مع فحص إضافي للتأكد من جلب البيانات"""
     url = f"https://finviz.com/screener.ashx?v=111&s={signal}"
-    res = requests.get(url, headers=FINVIZ_HEADERS, timeout=20)
-    res.raise_for_status()
-    parser = FinvizRowsParser()
-    parser.feed(res.text)
-    
-    rows = []
-    seen_keys = set()
-    for row in parser.rows:
-        key = row.get("row_key")
-        if not key or key in seen_keys:
-            continue
-        seen_keys.add(key)
-        rows.append(row)
-    return rows[:limit]
+    try:
+        res = requests.get(url, headers=FINVIZ_HEADERS, timeout=20)
+        res.raise_for_status()
+        parser = FinvizRowsParser()
+        parser.feed(res.text)
+        
+        rows = []
+        seen_keys = set()
+        for row in parser.rows:
+            key = row.get("row_key")
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            rows.append(row)
+        return rows[:limit]
+    except Exception as e:
+        print(f"⚠️ خطأ أثناء الاتصال بـ Finviz للرمز {signal}: {e}")
+        return []
 
-def send_telegram_message(message, parse_mode="Markdown"):
+def send_telegram_message(message, parse_mode="HTML"):
     """إرسال التقرير المنسق إلى التلغرام"""
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ خطأ: لم يتم العثور على إعدادات BOT_TOKEN أو CHAT_ID.")
@@ -219,12 +223,13 @@ def fetch_sec_filings_only(symbol):
                         acc_clean = acc_num.replace("-", "")
                         p_doc = primary_docs[i]
                         if p_doc:
-                            filing_url = ("https://www.sec.gov/Archives/edgar/data/" f"{cik_raw}/{acc_clean}/{p_doc}")
+                            filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik_raw}/{acc_clean}/{p_doc}"
                         else:
-                            filing_url = ("https://www.sec.gov/Archives/edgar/data/" f"{cik_raw}/{acc_clean}/{acc_num}-index.htm")
+                            filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik_raw}/{acc_clean}/{acc_num}-index.htm"
                         filings.append({"form": f_form, "date": f_date, "url": filing_url, "accession": acc_num, "brief": get_sec_description(f_form, f_items)})
     except Exception as e:
         print(f"⚠️ خطأ في جلب إفصاحات SEC لـ {symbol}: {e}")
+    
     sec_lines = []
     seen_accessions = set()
     latest_accession = ""
@@ -250,8 +255,8 @@ def is_excluded_sector(stock):
             return True
     return False
 
-def send_stock_cards(session_name, stocks, signal_label, skip_tickers=None):
-    """إرسال كل سهم في بطاقة مستقلة، مع ترقيم التنبيهات ومنع التكرار عند ثبات السعر"""
+def send_stock_cards(session_en, session_ar, stocks, signal_label, skip_tickers=None):
+    """إرسال البطاقات مع فصل النصوص لمنع مشكلة انعكاس الاتجاهات في تيليجرام"""
     state = get_alert_state()
     sent = 0
     skip_tickers = skip_tickers or set()
@@ -262,20 +267,17 @@ def send_stock_cards(session_name, stocks, signal_label, skip_tickers=None):
         if not ticker or price is None or price <= 0:
             continue
         
-        # تخطي السهم إذا كان موجوداً مسبقاً في أنماط أخرى
         if ticker in skip_tickers:
             continue
         
-        # شرط الحجم: أكبر من 10 آلاف سهم
         volume = to_float(stock.get('volume'))
         if volume is None or volume <= 10000:
             continue
         
-        # استبعاد البنوك والمطاعم والمشروبات والتأمين
         if is_excluded_sector(stock):
             continue
         
-        key = f"{session_name}:{ticker}"
+        key = f"{session_en}:{ticker}"
         last = state.get(key)
         
         if last and price <= last["price"]:
@@ -289,8 +291,11 @@ def send_stock_cards(session_name, stocks, signal_label, skip_tickers=None):
             f"&CIK={cik_val or ticker}&type=&dateb=&owner=include&count=40"
         )
         
+        # تنسيق مرتب ومنفصل لتجنب مشاكل الاتجاهات (Bidi) في تيليجرام
         message = (
-            f"🚨 <b>تنبيه {alert_no}</b> · {html.escape(session_name)}\n"
+            f"🚨 <b>تنبيه رقم {alert_no}</b>\n"
+            f"🌐 <code>{html.escape(session_en)}</code>\n"
+            f"📌 <i>{html.escape(session_ar)}</i>\n\n"
             f"📡 Pattern: <b>{html.escape(signal_label)}</b>\n\n"
             f"🔹 <b>{html.escape(ticker)}</b>\n"
             f"💵 <code>${price:.2f}</code> · 📈 <code>{html.escape(str(stock.get('change', '-')))}</code>\n"
@@ -299,8 +304,7 @@ def send_stock_cards(session_name, stocks, signal_label, skip_tickers=None):
             f"🏷️ الصناعة: <code>{html.escape(str(stock.get('industry', '-')))}</code>\n\n"
             f"📄 <b>آخر إفصاحات SEC</b>\n"
             f"{sec_summary}\n\n"
-            f"📈 <a href='{tv_url}'>TradingView</a>\n"
-            f"🏛️ <a href='{html.escape(sec_page_url)}'>SEC</a>"
+            f"📈 <a href='{tv_url}'>TradingView</a> | 🏛️ <a href='{html.escape(sec_page_url)}'>SEC</a>"
         )
         
         if send_telegram_message(message, parse_mode="HTML"):
@@ -310,27 +314,28 @@ def send_stock_cards(session_name, stocks, signal_label, skip_tickers=None):
     
     return sent
 
-def fetch_and_alert(session_label):
+def fetch_and_alert(session_en, session_ar):
     seen_tickers = set()
 
-    # قائمة الأنماط المطلوبة (يومي وأسبوعي)
+    # الأنماط الصحيحة والمعتمدة في الفاحص
     patterns = [
-        ('ta_headandshoulders', "Head & Shoulders (Daily)"),
+        ('ta_headandshoulders', "Head & Shoulders"),
         ('ta_headandshoulders_weekly', "Head & Shoulders (Weekly)"),
-        ('ta_doublebottom', "Double Bottom (Daily)"),
+        ('ta_doublebottom', "Double Bottom"),
         ('ta_doublebottom_weekly', "Double Bottom (Weekly)"),
-        ('ta_multiplebottom', "Multiple Bottom (Daily)"),
+        ('ta_multiplebottom', "Multiple Bottom"),
         ('ta_multiplebottom_weekly', "Multiple Bottom (Weekly)"),
     ]
 
     for sig, label in patterns:
         try:
-            print(f"⏳ [{session_label}] فحص نمط {label}...")
+            print(f"⏳ [{session_en}] فحص نمط {label}...")
             data_rows = fetch_finviz_signal(sig)
             if not data_rows:
                 print(f"⚠️ لم يتم العثور على أسهم في {label}.")
+                continue
             
-            sent = send_stock_cards(session_label, data_rows, label, skip_tickers=seen_tickers)
+            sent = send_stock_cards(session_en, session_ar, data_rows, label, skip_tickers=seen_tickers)
             print(f"✅ {label}: تم إرسال {sent} بطاقة.")
             for s in data_rows:
                 t = str(s.get('row_key', '')).strip().upper()
@@ -339,11 +344,11 @@ def fetch_and_alert(session_label):
         except Exception as e:
             print(f"❌ خطأ في جلب {label}: {e}")
 
-        time.sleep(4)  # فاصل أمان لحماية الـ IP
+        time.sleep(4)
 
 def main_loop():
     print("🚀 تم تشغيل الرادار ليعمل 3 مرات فقط يومياً حسب المواعيد المحددة...")
-    send_telegram_message("🟢 *تم تشغيل رادار الأنماط الفنية (يعمل 3 مرات يومياً بالمواعيد المحددة)*")
+    send_telegram_message("🟢 <b>تم تشغيل رادار الأنماط الفنية بنجاح</b>\n📌 (يعمل 3 مرات يومياً بالمواعيد المحددة)")
     
     executed_slots = {"date": None, "slots": set()}
     
@@ -363,25 +368,24 @@ def main_loop():
             # 1. قبل افتتاح السوق بساعتين (07:30 صباحاً بتوقيت نيويورك)
             if now_ny.hour == 7 and now_ny.minute == 30 and "slot1" not in executed_slots["slots"]:
                 print("⏰ تنفيذ موعد: قبل افتتاح السوق بساعتين")
-                fetch_and_alert("Pre-Market Scan (قبل الافتتاح بـ 2س) 🌅")
+                fetch_and_alert("Pre-Market Scan", "قبل الافتتاح بـ ساعتين 🌅")
                 executed_slots["slots"].add("slot1")
                 
             # 2. بعد إغلاق السوق بساعة (17:00 مساءً بتوقيت نيويورك)
             if now_ny.hour == 17 and now_ny.minute == 0 and "slot2" not in executed_slots["slots"]:
                 print("⏰ تنفيذ موعد: بعد إغلاق السوق بساعة")
-                fetch_and_alert("Post-Market Scan (بعد الإغلاق بـ 1س) 🌆")
+                fetch_and_alert("Post-Market Scan", "بعد الإغلاق بساعة 🌆")
                 executed_slots["slots"].add("slot2")
                 
             # 3. الساعة 17:00 بتوقيت السعودية كل أيام الأسبوع
             if now_riyadh.hour == 17 and now_riyadh.minute == 0 and "slot3" not in executed_slots["slots"]:
                 print("⏰ تنفيذ موعد: الساعة 17:00 بتوقيت السعودية")
-                fetch_and_alert("Daily KSA 17:00 Scan 📊")
+                fetch_and_alert("Daily KSA Scan", "تحديث السوق اليومي 17:00 📊")
                 executed_slots["slots"].add("slot3")
                 
         except Exception as e:
             print(f"❌ خطأ في حلقة المواعيد: {e}")
             
-        # التحقق كل 30 ثانية لضمان عدم تفويت الدقيقة المحددة
         time.sleep(30)
 
 if __name__ == "__main__":
