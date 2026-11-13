@@ -2,10 +2,9 @@ name: telegram-bot
 
 on:
   schedule:
-    - cron: "0 * * * *"     # تحقق كل ساعة (يبقى تشغيل واحد فقط بفضل concurrency)
-  workflow_dispatch:         # تشغيل يدوي من تبويب Actions
+    - cron: "0 * * * *"
+  workflow_dispatch:
 
-# تشغيل واحد في كل مرة؛ التشغيل الجديد ينتظر انتهاء الحالي ثم يبدأ فوراً
 concurrency:
   group: telegram-bot
   cancel-in-progress: false
@@ -13,7 +12,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -24,21 +23,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install OCR (لاستخراج النص من الصور)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-ara
-
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml deep-translator pypdf python-docx \
-                      python-pptx openpyxl yfinance pandas pillow pytesseract
+          pip install requests pytz
 
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}   # اختياري: "MyBot myemail@gmail.com"
-          RUN_SECONDS: "20700"                            # ~5 ساعات و45 دقيقة
+          RUN_SECONDS: "20700"
         run: python bot.py
