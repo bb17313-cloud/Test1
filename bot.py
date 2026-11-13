@@ -8,12 +8,12 @@ import requests
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "20700"))  # تقريباً 5 ساعات و45 دقيقة
 
 FINVIZ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# لمنع تكرار نفس السعر لنفس السهم خلال الدورة
 alerts_state = {}
 
 class FinvizRowsParser(HTMLParser):
@@ -52,8 +52,7 @@ class FinvizRowsParser(HTMLParser):
         if self.cell_id is not None:
             self.cell_text.append(data)
 
-def fetch_finviz_top_gainers(limit=20):
-    """جلب الأسهم المتحركة (Top Gainers) حالياً"""
+def fetch_finviz_top_gainers(limit=15):
     url = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
     try:
         res = requests.get(url, headers=FINVIZ_HEADERS, timeout=20)
@@ -71,43 +70,38 @@ def fetch_finviz_top_gainers(limit=20):
             rows.append(row)
         return rows[:limit]
     except Exception as e:
-        print(f"⚠️ خطأ أثناء الاتصال بـ Finviz: {e}")
+        print(f"⚠️ خطأ Finviz: {e}")
         return []
 
-def send_telegram_message(message, parse_mode="HTML"):
+def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
-        print("❌ خطأ: لم يتم العثور على إعدادات BOT_TOKEN أو CHAT_ID.")
+        print("❌ BOT_TOKEN أو CHAT_ID غير موجود")
         return False
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
-        "parse_mode": parse_mode,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        if response.status_code != 200:
-            print(f"❌ فشل إرسال رسالة التلغرام: {response.text}")
-            return False
-        return True
+        r = requests.post(url, json=payload, timeout=15)
+        return r.status_code == 200
     except Exception as e:
-        print(f"❌ خطأ أثناء الاتصال بالتلغرام: {e}")
+        print(f"❌ خطأ تلغرام: {e}")
         return False
 
 def to_float(value):
     try:
         return float(str(value).replace(",", "").replace("%", "").strip())
-    except (TypeError, ValueError):
+    except:
         return None
 
 def send_movers():
-    """إرسال الأسهم المتحركة حالياً بدون أي شروط"""
     global alerts_state
-    data_rows = fetch_finviz_top_gainers(limit=15)
+    data_rows = fetch_finviz_top_gainers(15)
     if not data_rows:
-        print("⚠️ لم يتم العثور على أسهم متحركة.")
+        print("⚠️ ما لقيت أسهم متحركة")
         return 0
 
     sent = 0
@@ -119,17 +113,14 @@ def send_movers():
         if not ticker or price is None or price <= 0:
             continue
 
-        # تجنب إرسال نفس السعر بالضبط لنفس السهم في الدورة الحالية
         last_price = alerts_state.get(ticker)
-        if last_price is not None and abs(price - last_price) < 0.001:
+        if last_price is not None and abs(price - last_price) < 0.005:
             continue
 
         change = str(stock.get('change', '-'))
         volume = str(stock.get('volume', '-'))
         sector = str(stock.get('sector', '-'))
         industry = str(stock.get('industry', '-'))
-
-        tv_url = f"https://www.tradingview.com/chart/?symbol={ticker}"
 
         message = (
             f"🚨 <b>Post-Market Mover</b>\n"
@@ -138,29 +129,36 @@ def send_movers():
             f"💵 <code>${price:.2f}</code> · 📈 <code>{html.escape(change)}</code>\n"
             f"📊 Vol: <code>{html.escape(volume)}</code>\n"
             f"🏭 {html.escape(sector)} · {html.escape(industry)}\n\n"
-            f"📈 <a href='{tv_url}'>TradingView</a>"
+            f"📈 <a href='https://www.tradingview.com/chart/?symbol={ticker}'>TradingView</a>"
         )
 
         if send_telegram_message(message):
             alerts_state[ticker] = price
             sent += 1
-            time.sleep(0.8)
+            time.sleep(0.7)
 
     return sent
 
-def main_loop():
-    print("🚀 رادار Post-Market يعمل كل 3 دقائق...")
-    send_telegram_message("🟢 <b>تم تشغيل رادار Post-Market</b>\n📌 يجلب الأسهم المتحركة كل 3 دقائق بدون شروط")
+def main():
+    start_time = time.time()
+    print(f"🚀 رادار Post-Market بدأ | سيعمل لمدة {RUN_SECONDS // 60} دقيقة")
+    send_telegram_message("🟢 <b>تم تشغيل رادار Post-Market</b>\n📌 يفحص كل 3 دقائق")
 
     while True:
+        elapsed = time.time() - start_time
+        if elapsed >= RUN_SECONDS:
+            print("⏰ انتهى وقت التشغيل المحدد")
+            send_telegram_message("🔴 <b>انتهى تشغيل الرادار</b>")
+            break
+
         try:
-            print(f"⏳ فحص الأسهم المتحركة... {datetime.now().strftime('%H:%M:%S')}")
+            print(f"⏳ فحص... {datetime.now().strftime('%H:%M:%S')}")
             sent = send_movers()
-            print(f"✅ تم إرسال {sent} بطاقة.")
+            print(f"✅ أرسل {sent} بطاقة")
         except Exception as e:
             print(f"❌ خطأ: {e}")
 
         time.sleep(180)  # كل 3 دقائق
 
 if __name__ == "__main__":
-    main_loop()
+    main()
