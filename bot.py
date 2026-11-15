@@ -3,16 +3,22 @@ import time
 import html
 from html.parser import HTMLParser
 from datetime import datetime
-import pytz
+from zoneinfo import ZoneInfo
 import requests
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "20700"))
+# اتركه كبير أو احذفه إذا تبي يشتغل طول الوقت
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "86400"))
 
 FINVIZ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+
+# حالة الأسهم (عدد مرات الظهور)
+seen_counts = {}          # ticker -> عدد مرات الظهور
+current_session = None    # لتصفير العداد عند تغيير الجلسة
+
 
 class FinvizRowsParser(HTMLParser):
     def __init__(self):
@@ -43,12 +49,31 @@ class FinvizRowsParser(HTMLParser):
             return
         self.cell_depth -= 1
         if self.cell_depth == 0:
-            self.current_row[self.cell_id] = "".join(self.cell_text).strip()
+            self.current_row[self.cell_id] = "".joinjoin(self.cell_text).strip()
             self.cell_id = None
 
     def handle_data(self, data):
         if self.cell_id is not None:
             self.cell_text.append(data)
+
+
+def get_session_info():
+    """يرجع (اسم الجلسة, عنوان الرسالة, هل الجلسة نشطة)"""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    t = now_et.hour * 60 + now_et.minute   # دقائق من منتصف الليل
+
+    # Pre: 04:00 - 09:30
+    if 4 * 60 <= t < 9 * 60 + 30:
+        return "pre", "Pre-Market Movers", True
+    # Main: 09:30 - 16:00
+    elif 9 * 60 + 30 <= t < 16 * 60:
+        return "main", "Market Movers", True
+    # Post: 16:00 - 20:00
+    elif 16 * 60 <= t < 20 * 60:
+        return "post", "Post-Market Movers", True
+    else:
+        return "closed", "Market Closed", False
+
 
 def fetch_top_gainers(limit=15):
     url = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
@@ -78,6 +103,7 @@ def fetch_top_gainers(limit=15):
         print(f"⚠️ خطأ Finviz: {e}")
         return []
 
+
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ BOT_TOKEN أو CHAT_ID غير موجود")
@@ -96,31 +122,48 @@ def send_telegram(message):
         print(f"❌ خطأ تلغرام: {e}")
         return False
 
-def build_message(stocks):
+
+def build_message(stocks, session_title):
     if not stocks:
         return None
 
-    now = datetime.now(pytz.timezone("Asia/Riyadh")).strftime("%H:%M")
+    now = datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%H:%M")
     lines = [
-        f"🚨 <b>Post-Market Movers</b>",
+        f"🚨 <b>{session_title}</b>",
         f"⏰ <code>{now}</code>",
         ""
     ]
 
     for i, s in enumerate(stocks, 1):
-        ticker = html.escape(s["ticker"])
+        ticker = s["ticker"]
         price = html.escape(str(s["price"]))
         change = html.escape(str(s["change"]))
-        lines.append(f"<b>{i}. {ticker}</b>  ·  <code>${price}</code>  ·  {change}")
+
+        # عداد الظهور
+        count = seen_counts.get(ticker, 0) + 1
+        seen_counts[ticker] = count
+
+        if count == 1:
+            badge = " <b>NEW</b>"
+        else:
+            badge = f" <b>#{count}</b>"
+
+        # رابط TradingView (اضغط على الرمز فقط)
+        tv_link = f'<a href="https://www.tradingview.com/chart/?symbol={ticker}">{html.escape(ticker)}</a>'
+
+        lines.append(f"<b>{i}.</b> {tv_link}  ·  <code>${price}</code>  ·  {change}{badge}")
 
     lines.append("")
     lines.append("📊 المصدر: Finviz")
     return "\n".join(lines)
 
+
 def main():
+    global current_session, seen_counts
+
     start_time = time.time()
-    print(f"🚀 رادار Post-Market بدأ (قائمة مجمعة كل 3 دقائق)")
-    send_telegram("🟢 <b>تم تشغيل رادار Post-Market</b>\n📌 يرسل قائمة مجمعة كل 3 دقائق")
+    print("🚀 رادار الجلسات الثلاث بدأ (Pre / Main / Post) - كل 3 دقائق")
+    send_telegram("🟢 <b>تم تشغيل رادار الجلسات</b>\n📌 Pre · Main · Post\n⏱ يحدث كل 3 دقائق من أول دقيقة في كل جلسة")
 
     last_hash = None
 
@@ -130,18 +173,32 @@ def main():
             send_telegram("🔴 <b>انتهى تشغيل الرادار</b>")
             break
 
+        session_key, session_title, is_active = get_session_info()
+
+        # تصفير العدادات عند تغيير الجلسة
+        if session_key != current_session:
+            seen_counts = {}
+            current_session = session_key
+            last_hash = None
+            print(f"🔄 جلسة جديدة: {session_title}")
+
+        if not is_active:
+            print(f"⏸ السوق مغلق حالياً ({session_title})")
+            time.sleep(180)
+            continue
+
         try:
-            print(f"⏳ فحص... {datetime.now().strftime('%H:%M:%S')}")
+            print(f"⏳ فحص {session_title}... {datetime.now().strftime('%H:%M:%S')}")
             stocks = fetch_top_gainers(15)
 
             if stocks:
-                msg = build_message(stocks)
+                msg = build_message(stocks, session_title)
                 current_hash = hash(msg)
 
                 if current_hash != last_hash:
                     if send_telegram(msg):
                         last_hash = current_hash
-                        print(f"✅ أرسل قائمة بـ {len(stocks)} سهم")
+                        print(f"✅ أرسل قائمة بـ {len(stocks)} سهم - {session_title}")
                     else:
                         print("❌ فشل الإرسال")
                 else:
@@ -153,6 +210,7 @@ def main():
             print(f"❌ خطأ: {e}")
 
         time.sleep(180)
+
 
 if __name__ == "__main__":
     main()
