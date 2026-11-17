@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# قراءة المتغيرات من إعدادات GitHub Actions أو وضعها مباشرة هنا
+# قراءة المتغيرات من إعدادات GitHub Actions
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHAT_ID = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", "20700"))  # مدة التشغيل بالثواني
@@ -65,7 +65,7 @@ def format_message(stocks, session_title):
     return message
 
 def send_message(text):
-    """إرسال التحديث إلى البوت"""
+    """إرسال التحديث إلى تيليجرام"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
