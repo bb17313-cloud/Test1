@@ -1,216 +1,98 @@
-import os
 import time
-import html
-from html.parser import HTMLParser
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import requests
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-# اتركه كبير أو احذفه إذا تبي يشتغل طول الوقت
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "86400"))
+# إعدادات بوت تيليجرام
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # ضع توكن البوت هنا
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"      # ضع معرف الشات أو القناة هنا
 
-FINVIZ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
-
-# حالة الأسهم (عدد مرات الظهور)
-seen_counts = {}          # ticker -> عدد مرات الظهور
-current_session = None    # لتصفير العداد عند تغيير الجلسة
-
-
-class FinvizRowsParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.rows = []
-        self.current_row = None
-        self.cell_id = None
-        self.cell_depth = 0
-        self.cell_text = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag != "div":
-            return
-        a = dict(attrs)
-        if self.cell_id is not None:
-            self.cell_depth += 1
-            return
-        if "data-row-key" in a:
-            self.current_row = {"row_key": a["data-row-key"]}
-            self.rows.append(self.current_row)
-        elif self.current_row is not None and "data-column-id" in a:
-            self.cell_id = a["data-column-id"]
-            self.cell_depth = 1
-            self.cell_text = []
-
-    def handle_endtag(self, tag):
-        if tag != "div" or self.cell_id is None:
-            return
-        self.cell_depth -= 1
-        if self.cell_depth == 0:
-            self.current_row[self.cell_id] = "".joinjoin(self.cell_text).strip()
-            self.cell_id = None
-
-    def handle_data(self, data):
-        if self.cell_id is not None:
-            self.cell_text.append(data)
-
-
-def get_session_info():
-    """يرجع (اسم الجلسة, عنوان الرسالة, هل الجلسة نشطة)"""
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    t = now_et.hour * 60 + now_et.minute   # دقائق من منتصف الليل
-
-    # Pre: 04:00 - 09:30
-    if 4 * 60 <= t < 9 * 60 + 30:
-        return "pre", "Pre-Market Movers", True
-    # Main: 09:30 - 16:00
-    elif 9 * 60 + 30 <= t < 16 * 60:
-        return "main", "Market Movers", True
-    # Post: 16:00 - 20:00
-    elif 16 * 60 <= t < 20 * 60:
-        return "post", "Post-Market Movers", True
-    else:
-        return "closed", "Market Closed", False
-
-
-def fetch_top_gainers(limit=15):
-    url = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
+def get_webull_gainers(market_type="pre"):
+    """
+    سحب قائمة الأسهم الصاعدة من Webull
+    market_type: 'pre' لجلسة Pre-market أو 'post' لجلسة After-hours
+    """
+    # رابط واجهة ويبول لجلب الأسهم الصاعدة (Top Gainers)
+    # يمكن تغيير نوع الجلسة عبر المعاملات الخاصة بالرابط
+    url = f"https://quotes-api.webullfintech.com/api/stock/marketMover/getTopGainers?regionId=6&type={market_type}&count=20"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    
     try:
-        res = requests.get(url, headers=FINVIZ_HEADERS, timeout=20)
-        res.raise_for_status()
-        parser = FinvizRowsParser()
-        parser.feed(res.text)
-
-        rows = []
-        seen = set()
-        for row in parser.rows:
-            ticker = str(row.get("row_key", "")).strip().upper()
-            if not ticker or ticker in seen:
-                continue
-            seen.add(ticker)
-            rows.append({
-                "ticker": ticker,
-                "price": row.get("price", "-"),
-                "change": row.get("change", "-"),
-                "volume": row.get("volume", "-")
-            })
-            if len(rows) >= limit:
-                break
-        return rows
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # استخراج القائمة بناءً على بنية استجابة Webull
+            gainers_list = data.get("data", [])
+            return gainers_list
+        else:
+            print(f"خطأ في الاتصال: {response.status_code}")
+            return []
     except Exception as e:
-        print(f"⚠️ خطأ Finviz: {e}")
+        print(f"حدث خطأ أثناء جلب البيانات: {e}")
         return []
 
+def format_message(stocks, session_name):
+    """تنسيق الرسالة لإرسالها بشكل مرتب إلى تيليجرام"""
+    if not stocks:
+        return f"⚠️ لا توجد بيانات متاحة حالياً لجلسة {session_name}."
+    
+    message = f"🚨 **الأسهم المتحركة ({session_name}) - Webull**\n"
+    message += "⏰ التحديث اللحظي\n\n"
+    
+    for idx, stock in enumerate(stocks[:15], 1):
+        # استخراج البيانات الأساسية للسهم
+        symbol = stock.get("ticker", {}).get("symbol", "N/A")
+        name = stock.get("ticker", {}).get("name", "")
+        price = stock.get("pPrice", 0.0)
+        change_rate = stock.get("changeRate", 0.0)
+        
+        # تحويل نسبة التغير إلى نسبة مئوية
+        if change_rate:
+            change_pct = float(change_rate) * 100
+            sign = "+" if change_pct > 0 else ""
+        else:
+            change_pct = 0.0
+            sign = ""
 
-def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("❌ BOT_TOKEN أو CHAT_ID غير موجود")
-        return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        message += f"{idx}. **{symbol}** : `{sign}{change_pct:.2f}%` • ${price:.2f}\n"
+        
+    return message
+
+def send_to_telegram(text):
+    """إرسال الرسالة إلى تيليجرام"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
     }
     try:
-        r = requests.post(url, json=payload, timeout=15)
-        return r.status_code == 200
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json()
     except Exception as e:
-        print(f"❌ خطأ تلغرام: {e}")
-        return False
-
-
-def build_message(stocks, session_title):
-    if not stocks:
-        return None
-
-    now = datetime.now(ZoneInfo("Asia/Riyadh")).strftime("%H:%M")
-    lines = [
-        f"🚨 <b>{session_title}</b>",
-        f"⏰ <code>{now}</code>",
-        ""
-    ]
-
-    for i, s in enumerate(stocks, 1):
-        ticker = s["ticker"]
-        price = html.escape(str(s["price"]))
-        change = html.escape(str(s["change"]))
-
-        # عداد الظهور
-        count = seen_counts.get(ticker, 0) + 1
-        seen_counts[ticker] = count
-
-        if count == 1:
-            badge = " <b>NEW</b>"
-        else:
-            badge = f" <b>#{count}</b>"
-
-        # رابط TradingView (اضغط على الرمز فقط)
-        tv_link = f'<a href="https://www.tradingview.com/chart/?symbol={ticker}">{html.escape(ticker)}</a>'
-
-        lines.append(f"<b>{i}.</b> {tv_link}  ·  <code>${price}</code>  ·  {change}{badge}")
-
-    lines.append("")
-    lines.append("📊 المصدر: Finviz")
-    return "\n".join(lines)
-
+        print(f"خطأ في إرسال الرسالة لتيليجرام: {e}")
 
 def main():
-    global current_session, seen_counts
-
-    start_time = time.time()
-    print("🚀 رادار الجلسات الثلاث بدأ (Pre / Main / Post) - كل 3 دقائق")
-    send_telegram("🟢 <b>تم تشغيل رادار الجلسات</b>\n📌 Pre · Main · Post\n⏱ يحدث كل 3 دقائق من أول دقيقة في كل جلسة")
-
-    last_hash = None
-
+    print("🚀 بدء تشغيل رادار Webull للأسهم المتحركة...")
+    
+    # يمكنك ضبط الجلسة المطلوبة ('pre' أو 'post')
+    session = "post" # أو 'pre'
+    session_title = "Post-Market / After-hours"
+    
     while True:
-        if time.time() - start_time >= RUN_SECONDS:
-            print("⏰ انتهى وقت التشغيل")
-            send_telegram("🔴 <b>انتهى تشغيل الرادار</b>")
-            break
-
-        session_key, session_title, is_active = get_session_info()
-
-        # تصفير العدادات عند تغيير الجلسة
-        if session_key != current_session:
-            seen_counts = {}
-            current_session = session_key
-            last_hash = None
-            print(f"🔄 جلسة جديدة: {session_title}")
-
-        if not is_active:
-            print(f"⏸ السوق مغلق حالياً ({session_title})")
-            time.sleep(180)
-            continue
-
-        try:
-            print(f"⏳ فحص {session_title}... {datetime.now().strftime('%H:%M:%S')}")
-            stocks = fetch_top_gainers(15)
-
-            if stocks:
-                msg = build_message(stocks, session_title)
-                current_hash = hash(msg)
-
-                if current_hash != last_hash:
-                    if send_telegram(msg):
-                        last_hash = current_hash
-                        print(f"✅ أرسل قائمة بـ {len(stocks)} سهم - {session_title}")
-                    else:
-                        print("❌ فشل الإرسال")
-                else:
-                    print("⏸ نفس القائمة، ما أرسلت")
-            else:
-                print("⚠️ ما لقيت أسهم")
-
-        except Exception as e:
-            print(f"❌ خطأ: {e}")
-
+        print("جاري سحب التحديثات من Webull...")
+        stocks = get_webull_gainers(market_type=session)
+        
+        if stocks:
+            msg = format_message(stocks, session_title)
+            send_to_telegram(msg)
+            print("✅ تم إرسال التحديث بنجاح إلى تيليجرام.")
+        else:
+            print("⚠️ لم يتم العثور على أسهم جديدة أو فشل الجلب.")
+            
+        # الانتظار لمدة 3 دقائق (180 ثانية) قبل التحديث القادم
         time.sleep(180)
-
 
 if __name__ == "__main__":
     main()
